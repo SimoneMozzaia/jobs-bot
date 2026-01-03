@@ -37,7 +37,7 @@ def build_properties_for_create(job: Job, enrich: JobEnrichment | None) -> dict:
 
     props = {
         "Job Title": {"title": [{"text": {"content": job.title}}]},
-        "Job UID": {"rich_text": [{"tjjjjjjjjjjjjjjjjjjjjjjjhymmmmmmmmmmmmmmmmmmmmmmmmmmmjext": {"content": job.job_uid}}]},
+        "Job UID": rt(job.job_uid),
         "Job URL": {"url": job.url},
 
         "Status": {"status": {"name": _status_for_new_page(job.fit_score)}},
@@ -47,7 +47,7 @@ def build_properties_for_create(job: Job, enrich: JobEnrichment | None) -> dict:
 
         "First seen": {"date": {"start": job.first_seen.date().isoformat() if job.first_seen else today}},
         "Last checked": {"date": {"start": job.last_checked.date().isoformat() if job.last_checked else today}},
-   "Company": {"rich_text": [{"text": {"content": job.company}}]},
+        "Company": rt(job.company),
  }
 
     # Optional selects/rich text
@@ -93,7 +93,9 @@ def build_properties_for_update(job: Job, enrich: JobEnrichment | None) -> dict:
         "Fit score": {"number": job.fit_score if job.fit_score is not None else 0},
         "Fit class": {"select": {"name": _fit_class_from_score(job.fit_score)}},
         "Last checked": {"date": {"start": job.last_checked.date().isoformat() if job.last_checked else today}},
-    "Company": {"rich_text": [{"text": {"content": job.company}}]},
+        "Company": rt(job.company),
+        "Job UID": rt(job.job_uid),
+        "Job Title": {"title": [{"text": {"content": job.title}}]},
 }
 
     if job.location_raw:
