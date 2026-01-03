@@ -7,31 +7,37 @@ from jobs_bot.notion_client import NotionClient
 from jobs_bot.sync_notion import sync_pending_jobs
 
 
-def main():
-    s = get_settings()
-    SessionLocal = make_session_factory(s)
+def main() -> None:
+    settings = get_settings()
+    SessionLocal = make_session_factory(settings)
 
     with SessionLocal() as session:
-        ok, created = ingest_all_sources(
+        sources_ok, jobs_created = ingest_all_sources(
             session,
-            max_calls_per_day=s.max_calls_per_day,
-            max_fetch_per_run=s.max_fetch_per_run,
-            max_new_jobs_per_day=s.max_new_jobs_per_day,
-            request_timeout_s=s.request_timeout_s,
-            greenhouse_per_page=s.greenhouse_per_page,
-            greenhouse_max_pages=s.greenhouse_max_pages,
-            per_source_limit=(s.ingest_per_source_limit or None),
+            max_calls_per_day=settings.max_calls_per_day,
+            max_new_jobs_per_day=settings.max_new_jobs_per_day,
+            max_fetch_per_run=settings.max_fetch_per_run,
+            request_timeout_s=settings.request_timeout_s,
+            greenhouse_per_page=settings.greenhouse_per_page,
+            greenhouse_max_pages=settings.greenhouse_max_pages,
+            per_source_limit=(settings.ingest_per_source_limit or None),
         )
-        print(f"Sources OK: {ok}, Jobs created: {created}")
+        print(f"Sources OK: {sources_ok}, Jobs created: {jobs_created}")
 
-        if s.sync_to_notion == 1:
+        if settings.sync_to_notion:
             notion = NotionClient(
-                token=s.notion_token,
-                version=s.notion_version,
-                data_source_id=s.notion_data_source_id,
+                token=settings.notion_token,
+                version=settings.notion_version,
+                data_source_id=settings.notion_data_source_id,
+                timeout_s=settings.request_timeout_s,
             )
-            synced = sync_pending_jobs(session, notion, limit=s.sync_limit, fit_min=s.fit_min)
-            print(f"Synced {synced} job(s) to Notion.")
+            n = sync_pending_jobs(
+                session,
+                notion=notion,
+                limit=settings.sync_limit,
+                fit_min=settings.fit_min,
+            )
+            print(f"Synced {n} job(s) to Notion.")
 
 
 if __name__ == "__main__":

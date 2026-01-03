@@ -13,7 +13,11 @@ from sqlalchemy import (
     Text,
     text,
 )
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+_LONGTEXT = Text().with_variant(LONGTEXT, "mysql")
+_BIGINT = BigInteger().with_variant(Integer, "sqlite")
 
 
 class Base(DeclarativeBase):
@@ -23,10 +27,11 @@ class Base(DeclarativeBase):
 class Source(Base):
     __tablename__ = "sources"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    ats_type: Mapped[str] = mapped_column(Enum("greenhouse", "lever"), nullable=False)
+    # MySQL uses BIGINT AUTO_INCREMENT; SQLite needs INTEGER to autoincrement.
+    id: Mapped[int] = mapped_column(_BIGINT, primary_key=True, autoincrement=True)
+    ats_type: Mapped[str] = mapped_column(Enum("greenhouse", "lever"), nullable=False, index=True)
     company_slug: Mapped[str] = mapped_column(String(255), nullable=False)
-    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    company_name: Mapped[str | None] = mapped_column(String(255))
     api_base: Mapped[str] = mapped_column(String(512), nullable=False)
 
     is_active: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
@@ -57,7 +62,7 @@ class Job(Base):
     __tablename__ = "jobs"
 
     job_uid: Mapped[str] = mapped_column(String(40), primary_key=True)  # sha1 hex
-    source_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sources.id"), nullable=False)
+    source_id: Mapped[int] = mapped_column(_BIGINT, ForeignKey("sources.id"), nullable=False)
     ats_job_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
     title: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -76,8 +81,10 @@ class Job(Base):
     )
 
     raw_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    raw_text: Mapped[str | None] = mapped_column(_LONGTEXT)
+    salary_text: Mapped[str | None] = mapped_column(String(255))
 
-    fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), index=True)
     fit_class: Mapped[str] = mapped_column(
         Enum("Good", "Maybe", "No"), nullable=False, server_default=text("'No'")
     )
@@ -106,9 +113,6 @@ class Job(Base):
     source: Mapped["Source"] = relationship(back_populates="jobs")
     enrichment: Mapped["JobEnrichment"] = relationship(back_populates="job", uselist=False)
 
-    raw_text: Mapped[str | None] = mapped_column(Text)
-    salary_text: Mapped[str | None] = mapped_column(String(255))
-
 
 class JobEnrichment(Base):
     __tablename__ = "job_enrichment"
@@ -121,11 +125,9 @@ class JobEnrichment(Base):
     cons: Mapped[str | None] = mapped_column(Text)
     outreach_target: Mapped[str | None] = mapped_column(String(512))
 
-    # columns that exist in DB
     salary: Mapped[str | None] = mapped_column(String(255))
     llm_model: Mapped[str | None] = mapped_column(String(128))
     llm_tokens: Mapped[int | None] = mapped_column(Integer)
     enriched_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
 
     job: Mapped["Job"] = relationship(back_populates="enrichment")
-

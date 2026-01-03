@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import datetime as dt
-from sqlalchemy import select, or_
-from sqlalchemy.orm import Session
+import json
 
-from .models import Job, JobEnrichment
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session, selectinload
+
+from .models import Job, JobEnrichment, Source
 from .notion_client import NotionClient, NotionError
 
-def rt(value: str | None) -> dict:
-    """Notion rich_text helper. Never returns invalid rich_text items."""
+
+def _as_date(value: dt.datetime | None) -> str:
+    if value is None:
+        return dt.date.today().isoformat()
+    return value.date().isoformat()
+
+
+def _rt(value: str | None) -> dict:
     txt = (value or "").strip()
     if not txt:
         return {"rich_text": []}
     return {"rich_text": [{"text": {"content": txt}}]}
+
+
+def _title(value: str | None) -> dict:
+    txt = (value or "").strip() or "Untitled"
+    return {"title": [{"text": {"content": txt}}]}
 
 
 def _fit_class_from_score(score: int | None) -> str:
@@ -26,109 +39,136 @@ def _fit_class_from_score(score: int | None) -> str:
 
 
 def _status_for_new_page(score: int | None) -> str:
-    # Create-time default only; we never overwrite Status later.
-    if score is not None and score >= 75:
+    if score is None:
+        return "New"
+    if score >= 75:
         return "Shortlist"
-    return "New"
+    if score >= 60:
+        return "New"
+    return "Rejected"
 
 
-def build_properties_for_create(job: Job, enrich: JobEnrichment | None) -> dict:
-    today = dt.date.today().isoformat()
+def _source_label(source: Source | None) -> str:
+    ats_type = getattr(source, "ats_type", None)
+    if ats_type == "greenhouse":
+        return "Greenhouse"
+    if ats_type == "lever":
+        return "Lever"
+    return "Other"
 
-    props = {
-        "Job Title": {"title": [{"text": {"content": job.title}}]},
-        "Job UID": rt(job.job_uid),
+
+def _region_multi_select(source: Source | None) -> list[dict[str, str]]:
+    hint = getattr(source, "region_hint", None)
+    if not hint:
+        return []
+    return [{"name": str(hint)[:100]}]
+
+
+def build_properties_for_create(
+    job: Job,
+    enrich: JobEnrichment | None = None,
+    *,
+    src: Source | None = None,
+) -> dict:
+    source = getattr(job, "source", None) or src
+    salary = (getattr(enrich, "salary", None) or job.salary_text or "").strip() or None
+
+    props: dict[str, dict] = {
+        "Job Title": _title(job.title),
+        "Job UID": _rt(job.job_uid),
+        "Company": _rt(job.company),
         "Job URL": {"url": job.url},
-
         "Status": {"status": {"name": _status_for_new_page(job.fit_score)}},
-
-        "Fit score": {"number": job.fit_score if job.fit_score is not None else 0},
+        "Fit score": {"number": int(job.fit_score or 0)},
         "Fit class": {"select": {"name": _fit_class_from_score(job.fit_score)}},
+        "First seen": {"date": {"start": _as_date(job.first_seen)}},
+        "Last checked": {"date": {"start": _as_date(job.last_checked)}},
+        "Source": {"select": {"name": _source_label(source)}},
+        "Region": {"multi_select": _region_multi_select(source)},
+    }
 
-        "First seen": {"date": {"start": job.first_seen.date().isoformat() if job.first_seen else today}},
-        "Last checked": {"date": {"start": job.last_checked.date().isoformat() if job.last_checked else today}},
-        "Company": rt(job.company),
- }
-
-    # Optional selects/rich text
     if job.location_raw:
-        props["Location"] = {"rich_text": [{"text": {"content": job.location_raw}}]}
+        props["Location"] = _rt(job.location_raw)
     if job.workplace_raw:
         props["Workplace"] = {"select": {"name": job.workplace_raw}}
-    # Source is select (Greenhouse/Lever/Other) — we store ats_type in Source by convention
-    props["Source"] = {"select": {"name": "Other"}}  # default; ingestion will set correctly
+    if salary:
+        props["Salary"] = _rt(salary)
 
-    if job.salary_text:
-        props["Salary"] = {"rich_text": [{"text": {"content": job.salary_text}}]}
+    if job.penalty_flags:
+        props["Penalty flags"] = _rt(json.dumps(job.penalty_flags, ensure_ascii=False, sort_keys=True, indent=2))
 
     if enrich:
         if enrich.summary:
-            props["Summary"] = {"rich_text": [{"text": {"content": enrich.summary}}]}
+            props["Summary"] = _rt(enrich.summary)
         if enrich.pros:
-            props["Pros"] = {"rich_text": [{"text": {"content": enrich.pros}}]}
+            props["Pros"] = _rt(enrich.pros)
         if enrich.cons:
-            props["Cons"] = {"rich_text": [{"text": {"content": enrich.cons}}]}
+            props["Cons"] = _rt(enrich.cons)
         if enrich.outreach_target:
-            props["Best outreach target"] = {"rich_text": [{"text": {"content": enrich.outreach_target}}]}
+            props["Best outreach target"] = _rt(enrich.outreach_target)
         if enrich.skills_json and isinstance(enrich.skills_json, dict):
             skills = enrich.skills_json.get("skills") or []
             if isinstance(skills, list) and skills:
-                props["Skills required"] = {"multi_select": [{"name": s[:100]} for s in skills if isinstance(s, str)]}
+                props["Skills required"] = {"multi_select": [{"name": str(s)[:100]} for s in skills if s]}
 
-    # Ensure text fields exist to avoid “missing property type” surprises
-    props.setdefault("Summary", {"rich_text": [{"text": {"content": ""}}]})
-    props.setdefault("Pros", {"rich_text": [{"text": {"content": ""}}]})
-    props.setdefault("Cons", {"rich_text": [{"text": {"content": ""}}]})
-    props.setdefault("Best outreach target", {"rich_text": [{"text": {"content": ""}}]})
-    props.setdefault("Contact", {"rich_text": [{"text": {"content": ""}}]})
+    props.setdefault("Summary", {"rich_text": []})
+    props.setdefault("Pros", {"rich_text": []})
+    props.setdefault("Cons", {"rich_text": []})
+    props.setdefault("Best outreach target", {"rich_text": []})
+    props.setdefault("Contact", {"rich_text": []})
 
     return props
 
 
-def build_properties_for_update(job: Job, enrich: JobEnrichment | None) -> dict:
-    # DO NOT overwrite Status.
-    today = dt.date.today().isoformat()
+def build_properties_for_update(
+    job: Job,
+    enrich: JobEnrichment | None = None,
+    *,
+    src: Source | None = None,
+) -> dict:
+    source = getattr(job, "source", None) or src
+    salary = (getattr(enrich, "salary", None) or job.salary_text or "").strip() or None
 
-    props = {
-        "Fit score": {"number": job.fit_score if job.fit_score is not None else 0},
+    props: dict[str, dict] = {
+        "Job Title": _title(job.title),
+        "Job UID": _rt(job.job_uid),
+        "Company": _rt(job.company),
+        "Fit score": {"number": int(job.fit_score or 0)},
         "Fit class": {"select": {"name": _fit_class_from_score(job.fit_score)}},
-        "Last checked": {"date": {"start": job.last_checked.date().isoformat() if job.last_checked else today}},
-        "Company": rt(job.company),
-        "Job UID": rt(job.job_uid),
-        "Job Title": {"title": [{"text": {"content": job.title}}]},
-}
+        "Last checked": {"date": {"start": _as_date(job.last_checked)}},
+        "Source": {"select": {"name": _source_label(source)}},
+        "Region": {"multi_select": _region_multi_select(source)},
+    }
 
     if job.location_raw:
-        props["Location"] = {"rich_text": [{"text": {"content": job.location_raw}}]}
+        props["Location"] = _rt(job.location_raw)
     if job.workplace_raw:
         props["Workplace"] = {"select": {"name": job.workplace_raw}}
-    if job.salary_text:
-        props["Salary"] = {"rich_text": [{"text": {"content": job.salary_text}}]}
+    if salary:
+        props["Salary"] = _rt(salary)
+
+    if job.penalty_flags:
+        props["Penalty flags"] = _rt(json.dumps(job.penalty_flags, ensure_ascii=False, sort_keys=True, indent=2))
 
     if enrich:
         if enrich.summary is not None:
-            props["Summary"] = {"rich_text": [{"text": {"content": enrich.summary}}]}
+            props["Summary"] = _rt(enrich.summary)
         if enrich.pros is not None:
-            props["Pros"] = {"rich_text": [{"text": {"content": enrich.pros}}]}
+            props["Pros"] = _rt(enrich.pros)
         if enrich.cons is not None:
-            props["Cons"] = {"rich_text": [{"text": {"content": enrich.cons}}]}
+            props["Cons"] = _rt(enrich.cons)
         if enrich.outreach_target is not None:
-            props["Best outreach target"] = {"rich_text": [{"text": {"content": enrich.outreach_target}}]}
+            props["Best outreach target"] = _rt(enrich.outreach_target)
         if enrich.skills_json and isinstance(enrich.skills_json, dict):
             skills = enrich.skills_json.get("skills") or []
             if isinstance(skills, list):
-                props["Skills required"] = {"multi_select": [{"name": s[:100]} for s in skills if isinstance(s, str)]}
+                props["Skills required"] = {"multi_select": [{"name": str(s)[:100]} for s in skills if s]}
 
     return props
 
 
-def upsert_job_to_notion(
-    session: Session,
-    notion: NotionClient,
-    job: Job,
-    now: dt.datetime,
-) -> None:
-    enrich = session.get(JobEnrichment, job.job_uid)
+def upsert_job_to_notion(session: Session, notion: NotionClient, job: Job, now: dt.datetime) -> None:
+    enrich = job.enrichment
 
     try:
         if job.notion_page_id:
@@ -138,7 +178,6 @@ def upsert_job_to_notion(
             job.notion_last_sync = now
             return
 
-        # no page_id → dedupe by Job UID in Notion
         existing_page_id = notion.query_by_job_uid(job.job_uid)
         if existing_page_id:
             job.notion_page_id = existing_page_id
@@ -148,7 +187,6 @@ def upsert_job_to_notion(
             job.notion_last_sync = now
             return
 
-        # create new
         props = build_properties_for_create(job, enrich)
         page_id = notion.create_page(props)
         job.notion_page_id = page_id
@@ -157,16 +195,15 @@ def upsert_job_to_notion(
 
     except NotionError as e:
         job.notion_last_error = str(e)
-        # do not raise: keep the batch running
 
 
-def sync_pending_jobs(session: Session, notion: NotionClient, limit: int, fit_min: int) -> int:
+def sync_pending_jobs(session: Session, *, notion: NotionClient, limit: int, fit_min: int) -> int:
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
 
     stmt = (
         select(Job)
+        .options(selectinload(Job.source), selectinload(Job.enrichment))
         .where(
-            Job.fit_score.isnot(None),
             Job.fit_score >= fit_min,
             or_(Job.notion_last_sync.is_(None), Job.last_checked > Job.notion_last_sync),
         )
@@ -175,8 +212,8 @@ def sync_pending_jobs(session: Session, notion: NotionClient, limit: int, fit_mi
     )
 
     jobs = session.execute(stmt).scalars().all()
-    for j in jobs:
-        upsert_job_to_notion(session, notion, j, now)
+    for job in jobs:
+        upsert_job_to_notion(session, notion, job, now)
 
     session.commit()
     return len(jobs)
