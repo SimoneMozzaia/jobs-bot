@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sys
 import uuid
+from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from jobs_bot.config import get_settings
 from jobs_bot.db import make_session_factory
@@ -14,7 +16,7 @@ from jobs_bot.notion_client import NotionClient
 from jobs_bot.sync_notion import sync_pending_jobs
 
 
-def _collect_active_source_errors(session) -> list[str]:
+def _collect_active_source_errors(session: Session) -> list[str]:
     sources = session.execute(select(Source).where(Source.is_active == 1)).scalars().all()
     errors: list[str] = []
     for src in sources:
@@ -67,7 +69,9 @@ def main() -> None:
             },
         )
 
-        # Minimal alerting: if nothing succeeded, distinguish rate-limit vs actual failure.
+        # Minimal "internal alerting" via exit code:
+        # - Rate-limited run is NOT a failure (exit 0).
+        # - If nothing succeeded and it's not purely rate-limit, fail the unit (exit 2)
         if sources_ok == 0:
             errors = _collect_active_source_errors(session)
             lower = [e.lower() for e in errors]
@@ -85,8 +89,7 @@ def main() -> None:
                 )
                 sys.exit(2)
 
-        # Optional Notion sync
-        if settings.sync_to_notion:
+        if settings.sync_to_notion == 1:
             try:
                 notion = NotionClient(
                     token=settings.notion_token,
@@ -105,7 +108,7 @@ def main() -> None:
                     extra={"event": "notion_sync_done", "synced": synced},
                 )
             except Exception:
-                # Keep ingestion healthy even if Notion is down.
+                # Ingestion is the core; Notion is optional.
                 logger.exception("Notion sync failed.", extra={"event": "notion_sync_failed"})
 
 

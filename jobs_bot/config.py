@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 class Settings:
     """Application configuration loaded from environment variables."""
 
-    # Notion
+    # Notion (optional if SYNC_TO_NOTION=0)
     notion_token: str
     notion_version: str
     notion_data_source_id: str
@@ -47,6 +47,15 @@ class Settings:
         )
 
 
+def _parse_int(name: str, raw: str | None, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid integer for {name}: {raw!r}") from exc
+
+
 def validate_settings(s: Settings) -> None:
     """Fail-fast validation for numeric ranges and basic consistency."""
     errors: list[str] = []
@@ -68,8 +77,11 @@ def validate_settings(s: Settings) -> None:
     check_int("SYNC_LIMIT", s.sync_limit, min_v=1, max_v=500)
     check_int("FIT_MIN", s.fit_min, min_v=0, max_v=100)
 
+    # 0 = unlimited for per-day caps is allowed (implemented in api_usage)
     check_int("MAX_CALLS_PER_DAY", s.max_calls_per_day, min_v=0, max_v=10_000)
     check_int("MAX_NEW_JOBS_PER_DAY", s.max_new_jobs_per_day, min_v=0, max_v=50_000)
+
+    # max_fetch_per_run is used as a hard cap per run; keep it >= 1
     check_int("MAX_FETCH_PER_RUN", s.max_fetch_per_run, min_v=1, max_v=50_000)
 
     check_int("REQUEST_TIMEOUT_S", s.request_timeout_s, min_v=1, max_v=120)
@@ -80,6 +92,13 @@ def validate_settings(s: Settings) -> None:
 
     if s.sync_to_notion not in (0, 1):
         errors.append(f"SYNC_TO_NOTION must be 0 or 1 (got {s.sync_to_notion})")
+
+    # Notion becomes required only if sync enabled
+    if s.sync_to_notion == 1:
+        if not s.notion_token.strip():
+            errors.append("NOTION_TOKEN is required when SYNC_TO_NOTION=1")
+        if not s.notion_data_source_id.strip():
+            errors.append("NOTION_DATA_SOURCE_ID is required when SYNC_TO_NOTION=1")
 
     if errors:
         raise RuntimeError("Invalid configuration: " + "; ".join(errors))
@@ -94,25 +113,34 @@ def get_settings() -> Settings:
             raise RuntimeError(f"Missing required env var: {name}")
         return v
 
+    sync_to_notion = _parse_int("SYNC_TO_NOTION", os.getenv("SYNC_TO_NOTION"), 1)
+
+    # Notion envs are required only when sync_to_notion=1
+    notion_token = os.getenv("NOTION_TOKEN", "") if sync_to_notion == 0 else req("NOTION_TOKEN")
+    notion_data_source_id = (
+        os.getenv("NOTION_DATA_SOURCE_ID", "") if sync_to_notion == 0 else req("NOTION_DATA_SOURCE_ID")
+    )
+    notion_version = os.getenv("NOTION_VERSION", "2025-09-03")
+
     settings = Settings(
-        notion_token=req("NOTION_TOKEN"),
-        notion_version=os.getenv("NOTION_VERSION", "2025-09-03"),
-        notion_data_source_id=req("NOTION_DATA_SOURCE_ID"),
+        notion_token=notion_token,
+        notion_version=notion_version,
+        notion_data_source_id=notion_data_source_id,
         mysql_host=req("MYSQL_HOST"),
-        mysql_port=int(os.getenv("MYSQL_PORT", "3306")),
+        mysql_port=_parse_int("MYSQL_PORT", os.getenv("MYSQL_PORT"), 3306),
         mysql_db=req("MYSQL_DB"),
         mysql_user=req("MYSQL_USER"),
         mysql_password=req("MYSQL_PASSWORD"),
-        sync_limit=int(os.getenv("SYNC_LIMIT", "50")),
-        fit_min=int(os.getenv("FIT_MIN", "60")),
-        max_calls_per_day=int(os.getenv("MAX_CALLS_PER_DAY", "50")),
-        request_timeout_s=int(os.getenv("REQUEST_TIMEOUT_S", "20")),
-        greenhouse_per_page=int(os.getenv("GREENHOUSE_PER_PAGE", "100")),
-        greenhouse_max_pages=int(os.getenv("GREENHOUSE_MAX_PAGES", "50")),
-        ingest_per_source_limit=int(os.getenv("INGEST_PER_SOURCE_LIMIT", "0")),
-        max_fetch_per_run=int(os.getenv("MAX_FETCH_PER_RUN", "50")),
-        max_new_jobs_per_day=int(os.getenv("MAX_NEW_JOBS_PER_DAY", "200")),
-        sync_to_notion=int(os.getenv("SYNC_TO_NOTION", "1")),
+        sync_limit=_parse_int("SYNC_LIMIT", os.getenv("SYNC_LIMIT"), 50),
+        fit_min=_parse_int("FIT_MIN", os.getenv("FIT_MIN"), 60),
+        max_calls_per_day=_parse_int("MAX_CALLS_PER_DAY", os.getenv("MAX_CALLS_PER_DAY"), 50),
+        request_timeout_s=_parse_int("REQUEST_TIMEOUT_S", os.getenv("REQUEST_TIMEOUT_S"), 20),
+        greenhouse_per_page=_parse_int("GREENHOUSE_PER_PAGE", os.getenv("GREENHOUSE_PER_PAGE"), 100),
+        greenhouse_max_pages=_parse_int("GREENHOUSE_MAX_PAGES", os.getenv("GREENHOUSE_MAX_PAGES"), 50),
+        ingest_per_source_limit=_parse_int("INGEST_PER_SOURCE_LIMIT", os.getenv("INGEST_PER_SOURCE_LIMIT"), 0),
+        max_fetch_per_run=_parse_int("MAX_FETCH_PER_RUN", os.getenv("MAX_FETCH_PER_RUN"), 50),
+        max_new_jobs_per_day=_parse_int("MAX_NEW_JOBS_PER_DAY", os.getenv("MAX_NEW_JOBS_PER_DAY"), 200),
+        sync_to_notion=sync_to_notion,
     )
 
     validate_settings(settings)
