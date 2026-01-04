@@ -13,12 +13,17 @@ from jobs_bot.llm_client import OpenAIResponsesClient
 from jobs_bot.logging_utils import LogContext, configure_logging
 from jobs_bot.models import Source
 from jobs_bot.notion_client import NotionClient
+from jobs_bot.profile_bootstrap import bootstrap_profile
 from jobs_bot.sync_notion import sync_pending_jobs
 
 
 def _collect_active_source_errors(session) -> list[str]:
     sources = session.execute(select(Source).where(Source.is_active == 1)).scalars().all()
-    return [f"{s.ats_type}:{s.company_slug}: {s.last_error}" for s in sources if s.last_error]
+    errors: list[str] = []
+    for src in sources:
+        if src.last_error:
+            errors.append(f"{src.ats_type}:{src.company_slug}: {src.last_error}")
+    return errors
 
 
 def main() -> None:
@@ -45,13 +50,40 @@ def main() -> None:
             "enrich_with_llm": settings.enrich_with_llm,
             "enrich_limit": settings.enrich_limit,
             "multi_profile_enabled": multi_profile_enabled,
-            "profile_id": active_profile_id,
+            "active_profile_id": active_profile_id,
         },
     )
 
     SessionLocal = make_session_factory(settings)
 
     with SessionLocal() as session:
+        # Multi-profile bootstrap (fail-fast before consuming external API budgets)
+        if multi_profile_enabled:
+            try:
+                cv_path = settings.profile_cv_path
+                if cv_path is None:
+                    raise RuntimeError("profiles_dir is set but profile_cv_path is None")
+                profile, changed = bootstrap_profile(
+                    session,
+                    profile_id=settings.profile_id,
+                    cv_path=cv_path,
+                )
+                logger.info(
+                    "Profile bootstrapped.",
+                    extra={
+                        "event": "profile_bootstrap_done",
+                        "profile_id": profile.profile_id,
+                        "cv_sha256": profile.cv_sha256,
+                        "changed": changed,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Profile bootstrap failed.",
+                    extra={"event": "profile_bootstrap_failed", "profile_id": settings.profile_id},
+                )
+                sys.exit(2)
+
         sources_ok, jobs_created = ingest_all_sources(
             session,
             max_calls_per_day=settings.max_calls_per_day,
@@ -65,13 +97,18 @@ def main() -> None:
 
         logger.info(
             "Ingest completed.",
-            extra={"event": "ingest_done", "sources_ok": sources_ok, "jobs_created": jobs_created},
+            extra={
+                "event": "ingest_done",
+                "sources_ok": sources_ok,
+                "jobs_created": jobs_created,
+            },
         )
 
         if sources_ok == 0:
             errors = _collect_active_source_errors(session)
             lower = [e.lower() for e in errors]
             all_rate_limited = bool(errors) and all("rate limit" in e for e in lower)
+
             if all_rate_limited:
                 logger.warning(
                     "All sources blocked by rate limit.",
@@ -87,7 +124,7 @@ def main() -> None:
         if settings.enrich_with_llm:
             try:
                 client = OpenAIResponsesClient(
-                    api_key=settings.openai_api_key,
+                    api_key=(settings.openai_api_key or ""),
                     model=settings.openai_model,
                     base_url=settings.openai_base_url,
                     timeout_s=settings.request_timeout_s,
@@ -103,12 +140,14 @@ def main() -> None:
                         "openai_model": settings.openai_model,
                     },
                 )
+
                 if stats.attempted > 0 and stats.enriched == 0 and stats.failed == stats.attempted:
                     logger.error(
                         "All LLM enrichments failed.",
                         extra={"event": "alert_llm_all_failed", "attempted": stats.attempted},
                     )
                     sys.exit(2)
+
             except Exception:
                 logger.exception("LLM enrichment crashed.", extra={"event": "llm_enrich_crashed"})
                 sys.exit(2)
