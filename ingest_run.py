@@ -2,27 +2,23 @@ from __future__ import annotations
 
 import sys
 import uuid
-from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from jobs_bot.config import get_settings
 from jobs_bot.db import make_session_factory
+from jobs_bot.enrich_llm import enrich_pending_jobs
 from jobs_bot.ingest_ats import ingest_all_sources
+from jobs_bot.llm_client import OpenAIResponsesClient
 from jobs_bot.logging_utils import LogContext, configure_logging
 from jobs_bot.models import Source
 from jobs_bot.notion_client import NotionClient
 from jobs_bot.sync_notion import sync_pending_jobs
 
 
-def _collect_active_source_errors(session: Session) -> list[str]:
+def _collect_active_source_errors(session) -> list[str]:
     sources = session.execute(select(Source).where(Source.is_active == 1)).scalars().all()
-    errors: list[str] = []
-    for src in sources:
-        if src.last_error:
-            errors.append(f"{src.ats_type}:{src.company_slug}: {src.last_error}")
-    return errors
+    return [f"{s.ats_type}:{s.company_slug}: {s.last_error}" for s in sources if s.last_error]
 
 
 def main() -> None:
@@ -35,6 +31,9 @@ def main() -> None:
         logger.exception("Configuration invalid.", extra={"event": "config_invalid"})
         sys.exit(2)
 
+    multi_profile_enabled = bool(settings.profiles_dir)
+    active_profile_id = settings.profile_id if multi_profile_enabled else None
+
     logger.info(
         "Starting ingest run.",
         extra={
@@ -43,6 +42,10 @@ def main() -> None:
             "max_new_jobs_per_day": settings.max_new_jobs_per_day,
             "max_fetch_per_run": settings.max_fetch_per_run,
             "sync_to_notion": settings.sync_to_notion,
+            "enrich_with_llm": settings.enrich_with_llm,
+            "enrich_limit": settings.enrich_limit,
+            "multi_profile_enabled": multi_profile_enabled,
+            "profile_id": active_profile_id,
         },
     )
 
@@ -62,21 +65,13 @@ def main() -> None:
 
         logger.info(
             "Ingest completed.",
-            extra={
-                "event": "ingest_done",
-                "sources_ok": sources_ok,
-                "jobs_created": jobs_created,
-            },
+            extra={"event": "ingest_done", "sources_ok": sources_ok, "jobs_created": jobs_created},
         )
 
-        # Minimal "internal alerting" via exit code:
-        # - Rate-limited run is NOT a failure (exit 0).
-        # - If nothing succeeded and it's not purely rate-limit, fail the unit (exit 2)
         if sources_ok == 0:
             errors = _collect_active_source_errors(session)
             lower = [e.lower() for e in errors]
             all_rate_limited = bool(errors) and all("rate limit" in e for e in lower)
-
             if all_rate_limited:
                 logger.warning(
                     "All sources blocked by rate limit.",
@@ -89,7 +84,36 @@ def main() -> None:
                 )
                 sys.exit(2)
 
-        if settings.sync_to_notion == 1:
+        if settings.enrich_with_llm:
+            try:
+                client = OpenAIResponsesClient(
+                    api_key=settings.openai_api_key,
+                    model=settings.openai_model,
+                    base_url=settings.openai_base_url,
+                    timeout_s=settings.request_timeout_s,
+                )
+                stats = enrich_pending_jobs(session, client=client, limit=settings.enrich_limit)
+                logger.info(
+                    "LLM enrichment completed.",
+                    extra={
+                        "event": "llm_enrich_done",
+                        "attempted": stats.attempted,
+                        "enriched": stats.enriched,
+                        "failed": stats.failed,
+                        "openai_model": settings.openai_model,
+                    },
+                )
+                if stats.attempted > 0 and stats.enriched == 0 and stats.failed == stats.attempted:
+                    logger.error(
+                        "All LLM enrichments failed.",
+                        extra={"event": "alert_llm_all_failed", "attempted": stats.attempted},
+                    )
+                    sys.exit(2)
+            except Exception:
+                logger.exception("LLM enrichment crashed.", extra={"event": "llm_enrich_crashed"})
+                sys.exit(2)
+
+        if settings.sync_to_notion:
             try:
                 notion = NotionClient(
                     token=settings.notion_token,
@@ -102,13 +126,13 @@ def main() -> None:
                     notion=notion,
                     limit=settings.sync_limit,
                     fit_min=settings.fit_min,
+                    profile_id=active_profile_id,
                 )
                 logger.info(
                     "Notion sync completed.",
-                    extra={"event": "notion_sync_done", "synced": synced},
+                    extra={"event": "notion_sync_done", "synced": synced, "profile_id": active_profile_id},
                 )
             except Exception:
-                # Ingestion is the core; Notion is optional.
                 logger.exception("Notion sync failed.", extra={"event": "notion_sync_failed"})
 
 

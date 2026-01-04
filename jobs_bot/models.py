@@ -27,7 +27,6 @@ class Base(DeclarativeBase):
 class Source(Base):
     __tablename__ = "sources"
 
-    # MySQL uses BIGINT AUTO_INCREMENT; SQLite needs INTEGER to autoincrement.
     id: Mapped[int] = mapped_column(_BIGINT, primary_key=True, autoincrement=True)
     ats_type: Mapped[str] = mapped_column(Enum("greenhouse", "lever"), nullable=False, index=True)
     company_slug: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -61,7 +60,7 @@ class Source(Base):
 class Job(Base):
     __tablename__ = "jobs"
 
-    job_uid: Mapped[str] = mapped_column(String(40), primary_key=True)  # sha1 hex
+    job_uid: Mapped[str] = mapped_column(String(40), primary_key=True)
     source_id: Mapped[int] = mapped_column(_BIGINT, ForeignKey("sources.id"), nullable=False)
     ats_job_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
@@ -84,11 +83,11 @@ class Job(Base):
     raw_text: Mapped[str | None] = mapped_column(_LONGTEXT)
     salary_text: Mapped[str | None] = mapped_column(String(255))
 
+    # Legacy (single-profile) fields kept for backward compatibility
     fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), index=True)
     fit_class: Mapped[str] = mapped_column(
         Enum("Good", "Maybe", "No"), nullable=False, server_default=text("'No'")
     )
-
     penalty_flags: Mapped[dict | None] = mapped_column(JSON)
 
     notion_page_id: Mapped[str | None] = mapped_column(String(36))
@@ -112,6 +111,7 @@ class Job(Base):
 
     source: Mapped["Source"] = relationship(back_populates="jobs")
     enrichment: Mapped["JobEnrichment"] = relationship(back_populates="job", uselist=False)
+    profiles: Mapped[list["JobProfile"]] = relationship(back_populates="job")
 
 
 class JobEnrichment(Base):
@@ -131,3 +131,72 @@ class JobEnrichment(Base):
     enriched_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
 
     job: Mapped["Job"] = relationship(back_populates="enrichment")
+
+
+class Profile(Base):
+    """
+    Multi-profile identity.
+
+    CV is stored on disk (fixed path per profile), hash is stored in DB to detect changes.
+    """
+    __tablename__ = "profiles"
+
+    profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cv_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    cv_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    profile_json: Mapped[dict | None] = mapped_column(JSON)
+    profile_text: Mapped[str | None] = mapped_column(Text)
+    analyzed_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+    )
+
+    jobs: Mapped[list["JobProfile"]] = relationship(back_populates="profile")
+
+
+class JobProfile(Base):
+    """
+    Per-(job, profile) state.
+
+    This is where multi-profile will keep:
+    - fit_score / fit_class / penalty_flags
+    - notion mapping and sync timestamps (avoid collisions)
+    """
+    __tablename__ = "job_profile"
+
+    job_uid: Mapped[str] = mapped_column(String(40), ForeignKey("jobs.job_uid"), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(String(64), ForeignKey("profiles.profile_id"), primary_key=True)
+
+    fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), index=True)
+    fit_class: Mapped[str] = mapped_column(
+        Enum("Good", "Maybe", "No", name="fit_class_profile"),
+        nullable=False,
+        server_default=text("'No'"),
+    )
+    penalty_flags: Mapped[dict | None] = mapped_column(JSON)
+
+    notion_page_id: Mapped[str | None] = mapped_column(String(36))
+    notion_last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    notion_last_error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+    )
+
+    job: Mapped["Job"] = relationship(back_populates="profiles")
+    profile: Mapped["Profile"] = relationship(back_populates="jobs")
