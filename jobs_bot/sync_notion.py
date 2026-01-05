@@ -4,7 +4,7 @@ import datetime as dt
 import json
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import Job, JobEnrichment, JobProfile, Profile, Source
@@ -273,7 +273,49 @@ def sync_pending_jobs(
         .limit(limit)
     )
 
-    rows = session.execute(stmt).all()
+    rows: list[tuple[JobProfile, Job]] = list(session.execute(stmt).all())
+
+    # Backward-compatible path: when a job_profile row does not exist yet
+    # (e.g. first ever run, or older DB state), we can still sync using
+    # the legacy fields on `jobs` and bootstrap a minimal job_profile row.
+    #
+    # This preserves correct behavior for existing tests and makes the
+    # pipeline resilient when the scoring step has not run yet.
+    if len(rows) < limit:
+        missing_stmt = (
+            select(Job)
+            .options(selectinload(Job.source), selectinload(Job.enrichment))
+            .where(
+                Job.fit_score >= fit_min,
+                ~exists(
+                    select(1).where(
+                        JobProfile.job_uid == Job.job_uid,
+                        JobProfile.profile_id == profile_id,
+                    )
+                ),
+            )
+            .order_by(Job.last_seen.desc())
+            .limit(limit - len(rows))
+        )
+
+        missing_jobs = session.execute(missing_stmt).scalars().all()
+        for job in missing_jobs:
+            score = int(job.fit_score or 0)
+            fit_class = (job.fit_class or "").strip() or _fit_class_from_score(score)
+
+            jp = JobProfile(
+                job_uid=job.job_uid,
+                profile_id=profile_id,
+                fit_score=score,
+                fit_class=fit_class,
+                penalty_flags=getattr(job, "penalty_flags", None),
+                fit_job_last_checked=job.last_checked,
+                fit_profile_cv_sha256=cv_sha256,
+                fit_computed_at=now,
+            )
+            session.add(jp)
+            rows.append((jp, job))
+
     for jp, job in rows:
         upsert_job_profile_to_notion(
             session,

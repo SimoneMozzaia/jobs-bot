@@ -3,191 +3,242 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy import text
-from sqlalchemy.engine import Dialect
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+
+_API_DAILY_USAGE_TABLE = "api_daily_usage"
+_DAILY_NEW_JOBS_TABLE = "daily_new_jobs"
 
 
 def utcnow_naive() -> dt.datetime:
-    """UTC naive timestamp (tzinfo=None) to match DB columns stored as naive UTC."""
+    """Return a timezone-naive UTC timestamp."""
     return dt.datetime.now(dt.UTC).replace(tzinfo=None)
 
 
-def _utc_day() -> dt.date:
-    return dt.datetime.now(dt.UTC).date()
+def today_utc_date() -> str:
+    """Return today's UTC date as YYYY-MM-DD."""
+    return dt.datetime.now(dt.UTC).date().isoformat()
 
 
-def _dialect(session: Session) -> Dialect:
-    bind = session.get_bind()
-    if bind is None:
-        raise RuntimeError("Session is not bound to an engine/connection.")
-    return bind.dialect
+def _dialect(session: Session) -> str:
+    return session.get_bind().dialect.name
 
 
-def _is_sqlite(session: Session) -> bool:
-    return _dialect(session).name == "sqlite"
+def _ensure_api_usage_tables(session: Session) -> None:
+    """Create the internal usage tables if they don't exist.
 
-
-def _sqlite_table_exists(session: Session, table: str) -> bool:
+    These tables are created with raw SQL (not via ORM models) because they are
+    operational counters rather than domain entities.
     """
-    SQLite-only helper. Avoids raising OperationalError in tests when fixtures
-    do not create the counter tables.
-    """
-    res = session.execute(
-        text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:t LIMIT 1"),
-        {"t": table},
-    ).scalar_one_or_none()
-    return res is not None
+    dialect = _dialect(session)
 
-
-def _seed_counter_row_mysql(
-    session: Session,
-    *,
-    table: str,
-    insert_cols: tuple[str, ...],
-    insert_params: dict,
-    noop_col: str,
-) -> None:
-    cols_sql = ", ".join(insert_cols)
-    vals_sql = ", ".join(f":{c}" for c in insert_cols)
-    session.execute(
-        text(
-            f"""
-            INSERT INTO {table} ({cols_sql})
-            VALUES ({vals_sql})
-            ON DUPLICATE KEY UPDATE {noop_col} = {noop_col}
-            """
-        ),
-        insert_params,
-    )
-
-
-def _seed_counter_row_sqlite(
-    session: Session,
-    *,
-    table: str,
-    insert_cols: tuple[str, ...],
-    insert_params: dict,
-    where_keys: tuple[str, ...],
-) -> None:
-    """
-    SQLite-safe seed that does NOT require UNIQUE constraints.
-    Inserts only if no row exists (best-effort; fine for tests).
-    """
-    cols_sql = ", ".join(insert_cols)
-    vals_sql = ", ".join(f":{c}" for c in insert_cols)
-    where_sql = " AND ".join(f"{k} = :{k}" for k in where_keys)
-
-    session.execute(
-        text(
-            f"""
-            INSERT INTO {table} ({cols_sql})
-            SELECT {vals_sql}
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {table} WHERE {where_sql}
+    if dialect == "sqlite":
+        session.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_API_DAILY_USAGE_TABLE} (
+                    day TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, provider)
+                )
+                """
             )
-            """
-        ),
-        insert_params,
-    )
+        )
+        session.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_DAILY_NEW_JOBS_TABLE} (
+                    day TEXT NOT NULL PRIMARY KEY,
+                    new_jobs INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        )
+    else:
+        # MySQL / MariaDB
+        session.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_API_DAILY_USAGE_TABLE} (
+                    day DATE NOT NULL,
+                    provider VARCHAR(32) NOT NULL,
+                    calls INT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, provider)
+                ) ENGINE=InnoDB
+                """
+            )
+        )
+        session.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_DAILY_NEW_JOBS_TABLE} (
+                    day DATE NOT NULL PRIMARY KEY,
+                    new_jobs INT NOT NULL DEFAULT 0
+                ) ENGINE=InnoDB
+                """
+            )
+        )
+
+    session.flush()
 
 
-def can_consume_call(session: Session, ats_type: str, max_per_day: int) -> bool:
-    """
-    Provider-level daily API call cap.
+def _is_missing_column_error(exc: OperationalError, column: str) -> bool:
+    msg = str(exc).lower()
+    if f"no column named {column}" in msg:
+        return True
+    if f"unknown column '{column}'" in msg:
+        return True
+    if f"unknown column `{column}`" in msg:
+        return True
+    return False
 
-    True  -> consumed 1 call (counter incremented)
-    False -> cap reached (no increment)
 
-    Notes:
-    - On SQLite (tests), if the counter table is missing, we treat it as unlimited
-      (return True) rather than failing ingestion.
-    """
+def _ensure_usage_row(session: Session, *, day: str, column: str, provider: str) -> None:
+    dialect = _dialect(session)
+
+    if dialect == "sqlite":
+        session.execute(
+            text(
+                f"""
+                INSERT INTO {_API_DAILY_USAGE_TABLE} (day, {column}, calls)
+                SELECT :day, :provider, 0
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {_API_DAILY_USAGE_TABLE}
+                    WHERE day = :day AND {column} = :provider
+                )
+                """
+            ),
+            {"day": day, "provider": provider},
+        )
+    else:
+        session.execute(
+            text(
+                f"""
+                INSERT IGNORE INTO {_API_DAILY_USAGE_TABLE} (day, {column}, calls)
+                VALUES (:day, :provider, 0)
+                """
+            ),
+            {"day": day, "provider": provider},
+        )
+
+
+def _consume_call_with_column(
+    session: Session, *, day: str, column: str, provider: str, max_per_day: int
+) -> bool:
+    _ensure_usage_row(session, day=day, column=column, provider=provider)
+
     if max_per_day <= 0:
+        session.execute(
+            text(
+                f"""
+                UPDATE {_API_DAILY_USAGE_TABLE}
+                SET calls = calls + 1
+                WHERE day = :day AND {column} = :provider
+                """
+            ),
+            {"day": day, "provider": provider},
+        )
         return True
 
-    day = _utc_day()
-
-    if _is_sqlite(session) and not _sqlite_table_exists(session, "api_daily_usage"):
-        return True
-
-    if _is_sqlite(session):
-        _seed_counter_row_sqlite(
-            session,
-            table="api_daily_usage",
-            insert_cols=("day", "ats_type", "calls"),
-            insert_params={"day": day, "ats_type": ats_type, "calls": 0},
-            where_keys=("day", "ats_type"),
-        )
-    else:
-        _seed_counter_row_mysql(
-            session,
-            table="api_daily_usage",
-            insert_cols=("day", "ats_type", "calls"),
-            insert_params={"day": day, "ats_type": ats_type, "calls": 0},
-            noop_col="calls",
-        )
-
-    res = session.execute(
+    result = session.execute(
         text(
-            """
-            UPDATE api_daily_usage
+            f"""
+            UPDATE {_API_DAILY_USAGE_TABLE}
             SET calls = calls + 1
-            WHERE day = :day
-              AND ats_type = :ats_type
-              AND calls < :max_per_day
+            WHERE day = :day AND {column} = :provider AND calls < :max_per_day
             """
         ),
-        {"day": day, "ats_type": ats_type, "max_per_day": max_per_day},
+        {"day": day, "provider": provider, "max_per_day": max_per_day},
     )
-
-    # On SQLite, in edge cases rowcount may be >1 if the fixture created duplicates.
-    return (res.rowcount or 0) >= 1
+    return (result.rowcount or 0) == 1
 
 
-def can_create_new_job(session: Session, max_new_per_day: int) -> bool:
+def can_consume_call(session: Session, provider: str, *, max_per_day: int) -> bool:
+    """Consume one API call from the daily provider bucket.
+
+    Returns True if the call can be consumed (i.e., below the daily cap),
+    otherwise False.
     """
-    Daily cap on NEW job inserts (not updates).
+    if not provider:
+        raise ValueError("provider must be a non-empty string")
 
-    True  -> reserved 1 "new job slot" (counter incremented)
-    False -> cap reached (no increment)
+    _ensure_api_usage_tables(session)
+    day = today_utc_date()
 
-    Notes:
-    - On SQLite (tests), if the counter table is missing, we treat it as unlimited.
-    """
-    if max_new_per_day <= 0:
-        return True
-
-    day = _utc_day()
-
-    if _is_sqlite(session) and not _sqlite_table_exists(session, "job_daily_new"):
-        return True
-
-    if _is_sqlite(session):
-        _seed_counter_row_sqlite(
+    try:
+        return _consume_call_with_column(
             session,
-            table="job_daily_new",
-            insert_cols=("day", "created"),
-            insert_params={"day": day, "created": 0},
-            where_keys=("day",),
+            day=day,
+            column="provider",
+            provider=provider,
+            max_per_day=max_per_day,
+        )
+    except OperationalError as e:
+        # Backwards compatibility: older deployments used `ats_type` as the column
+        # name for the provider key.
+        if _is_missing_column_error(e, "provider"):
+            return _consume_call_with_column(
+                session,
+                day=day,
+                column="ats_type",
+                provider=provider,
+                max_per_day=max_per_day,
+            )
+        raise
+
+
+def can_create_new_job(session: Session, *, max_new_per_day: int) -> bool:
+    """Consume one unit from the daily NEW job creation counter."""
+    _ensure_api_usage_tables(session)
+    day = today_utc_date()
+    dialect = _dialect(session)
+
+    if dialect == "sqlite":
+        session.execute(
+            text(
+                f"""
+                INSERT INTO {_DAILY_NEW_JOBS_TABLE} (day, new_jobs)
+                SELECT :day, 0
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {_DAILY_NEW_JOBS_TABLE} WHERE day = :day
+                )
+                """
+            ),
+            {"day": day},
         )
     else:
-        _seed_counter_row_mysql(
-            session,
-            table="job_daily_new",
-            insert_cols=("day", "created"),
-            insert_params={"day": day, "created": 0},
-            noop_col="created",
+        session.execute(
+            text(
+                f"""
+                INSERT IGNORE INTO {_DAILY_NEW_JOBS_TABLE} (day, new_jobs)
+                VALUES (:day, 0)
+                """
+            ),
+            {"day": day},
         )
 
-    res = session.execute(
+    if max_new_per_day <= 0:
+        session.execute(
+            text(
+                f"""
+                UPDATE {_DAILY_NEW_JOBS_TABLE}
+                SET new_jobs = new_jobs + 1
+                WHERE day = :day
+                """
+            ),
+            {"day": day},
+        )
+        return True
+
+    result = session.execute(
         text(
-            """
-            UPDATE job_daily_new
-            SET created = created + 1
-            WHERE day = :day
-              AND created < :max_new_per_day
+            f"""
+            UPDATE {_DAILY_NEW_JOBS_TABLE}
+            SET new_jobs = new_jobs + 1
+            WHERE day = :day AND new_jobs < :max_new
             """
         ),
-        {"day": day, "max_new_per_day": max_new_per_day},
+        {"day": day, "max_new": max_new_per_day},
     )
-    return (res.rowcount or 0) >= 1
+    return (result.rowcount or 0) == 1
