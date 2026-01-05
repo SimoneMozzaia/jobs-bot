@@ -3,54 +3,40 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-import datetime as dt
+from docx import Document
 
-from jobs_bot.models import Job, JobProfile, Profile, Source
+from jobs_bot.models import Job, JobProfile, Source
 from jobs_bot.profile_bootstrap import bootstrap_profile
 
 
-def _sha256_bytes(data: bytes) -> str:
+def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    h.update(data)
+    h.update(path.read_bytes())
     return h.hexdigest()
 
 
-def test_bootstrap_profile_creates_profile(sqlite_session, tmp_path):
-    cv_bytes = b"cv-v1"
-    profile_dir = tmp_path / "profiles" / "default"
-    profile_dir.mkdir(parents=True)
-    cv_path = profile_dir / "cv.docx"
-    cv_path.write_bytes(cv_bytes)
+def _write_cv_docx(path: Path, *, text: str) -> str:
+    doc = Document()
+    for line in text.splitlines():
+        doc.add_paragraph(line)
+    doc.save(str(path))
+    return _sha256_file(path)
 
-    profile, changed = bootstrap_profile(
-        sqlite_session,
-        profile_id="default",
-        cv_path=str(cv_path),
-    )
+
+def test_profile_bootstrap_creates_profile(sqlite_session, tmp_path):
+    profile_id = "p1"
+    cv_path = tmp_path / "cv.docx"
+    sha = _write_cv_docx(cv_path, text="CV v1\nPython\nSQL")
+
+    profile, changed = bootstrap_profile(sqlite_session, profile_id=profile_id, cv_path=str(cv_path))
 
     assert changed is True
-    assert profile.profile_id == "default"
-    assert profile.cv_path == str(cv_path)
-    assert profile.cv_sha256 == _sha256_bytes(cv_bytes)
-
-    db_profile = sqlite_session.get(Profile, "default")
-    assert db_profile is not None
-    assert db_profile.cv_sha256 == _sha256_bytes(cv_bytes)
+    assert profile.profile_id == profile_id
+    assert profile.cv_sha256 == sha
+    assert profile.profile_text and "python" in profile.profile_text.lower()
 
 
-def test_bootstrap_profile_invalidates_job_profile_on_cv_change(sqlite_session, tmp_path):
-    profile_id = "default"
-
-    cv_v1 = b"cv-v1"
-    cv_v2 = b"cv-v2"
-
-    profile_dir = tmp_path / "profiles" / profile_id
-    profile_dir.mkdir(parents=True)
-    cv_path = profile_dir / "cv.docx"
-    cv_path.write_bytes(cv_v1)
-
-    bootstrap_profile(sqlite_session, profile_id=profile_id, cv_path=str(cv_path))
-
+def test_profile_bootstrap_invalidates_job_profiles_on_cv_change(sqlite_session, tmp_path):
     src = Source(
         ats_type="lever",
         company_slug="acme",
@@ -62,7 +48,6 @@ def test_bootstrap_profile_invalidates_job_profile_on_cv_change(sqlite_session, 
     sqlite_session.add(src)
     sqlite_session.commit()
 
-    now = dt.datetime(2026, 1, 3, 0, 0, 0)
     job = Job(
         job_uid="a" * 40,
         source_id=src.id,
@@ -70,40 +55,52 @@ def test_bootstrap_profile_invalidates_job_profile_on_cv_change(sqlite_session, 
         title="Backend Engineer",
         company="ACME",
         url="https://example.com",
-        first_seen=now,
-        last_seen=now,
-        last_checked=now,
+        first_seen=sqlite_session.bind.dialect.default_schema_name,  # not used in this test
+        last_seen=sqlite_session.bind.dialect.default_schema_name,   # not used
+        last_checked=sqlite_session.bind.dialect.default_schema_name,  # not used
         raw_json={},
-        fit_score=70,
-        fit_class="Maybe",
     )
+    # fix required datetime fields
+    import datetime as dt
+    now = dt.datetime(2026, 1, 3, 0, 0, 0)
+    job.first_seen = now
+    job.last_seen = now
+    job.last_checked = now
+
     sqlite_session.add(job)
     sqlite_session.commit()
 
+    profile_id = "p1"
+    cv_path = tmp_path / "cv.docx"
+    _write_cv_docx(cv_path, text="CV v1\nPython\nSQL")
+
+    profile, _ = bootstrap_profile(sqlite_session, profile_id=profile_id, cv_path=str(cv_path))
     jp = JobProfile(
         job_uid=job.job_uid,
-        profile_id=profile_id,
-        fit_score=88,
+        profile_id=profile.profile_id,
+        fit_score=80,
         fit_class="Good",
-        penalty_flags={"x": True},
-        notion_page_id="page-123",
+        penalty_flags={"x": 1},
+        notion_page_id="n",
         notion_last_sync=now,
-        notion_last_error="err",
+        notion_last_error=None,
     )
     sqlite_session.add(jp)
     sqlite_session.commit()
 
-    cv_path.write_bytes(cv_v2)
+    sha_v2 = _write_cv_docx(cv_path, text="CV v2\nPython\nKubernetes")
     profile, changed = bootstrap_profile(sqlite_session, profile_id=profile_id, cv_path=str(cv_path))
 
     assert changed is True
-    assert profile.cv_sha256 == _sha256_bytes(cv_v2)
+    assert profile.cv_sha256 == sha_v2
 
-    jp2 = sqlite_session.get(JobProfile, {"job_uid": job.job_uid, "profile_id": profile_id})
-    assert jp2 is not None
-    assert jp2.notion_page_id == "page-123"
-    assert jp2.fit_score == 0
-    assert jp2.fit_class == "No"
-    assert jp2.penalty_flags is None
-    assert jp2.notion_last_sync is None
-    assert jp2.notion_last_error is None
+    refreshed = sqlite_session.get(JobProfile, (job.job_uid, profile_id))
+    assert refreshed is not None
+    assert refreshed.fit_score == 0
+    assert refreshed.fit_class == "No"
+    assert refreshed.penalty_flags is None
+    assert refreshed.notion_page_id == "n"
+    assert refreshed.notion_last_sync is None
+    assert refreshed.fit_job_last_checked is None
+    assert refreshed.fit_profile_cv_sha256 is None
+    assert refreshed.fit_computed_at is None

@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    func,
     text,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -83,7 +84,6 @@ class Job(Base):
     raw_text: Mapped[str | None] = mapped_column(_LONGTEXT)
     salary_text: Mapped[str | None] = mapped_column(String(255))
 
-    # Legacy (single-profile) fields kept for backward compatibility
     fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), index=True)
     fit_class: Mapped[str] = mapped_column(
         Enum("Good", "Maybe", "No"), nullable=False, server_default=text("'No'")
@@ -134,11 +134,6 @@ class JobEnrichment(Base):
 
 
 class Profile(Base):
-    """
-    Multi-profile identity.
-
-    CV is stored on disk (fixed path per profile), hash is stored in DB to detect changes.
-    """
     __tablename__ = "profiles"
 
     profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -151,52 +146,47 @@ class Profile(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+        DateTime, server_default=func.current_timestamp(), nullable=False
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP"),
-        server_onupdate=text("CURRENT_TIMESTAMP"),
     )
-
-    jobs: Mapped[list["JobProfile"]] = relationship(back_populates="profile")
 
 
 class JobProfile(Base):
-    """
-    Per-(job, profile) state.
-
-    This is where multi-profile will keep:
-    - fit_score / fit_class / penalty_flags
-    - notion mapping and sync timestamps (avoid collisions)
-    """
     __tablename__ = "job_profile"
 
     job_uid: Mapped[str] = mapped_column(String(40), ForeignKey("jobs.job_uid"), primary_key=True)
     profile_id: Mapped[str] = mapped_column(String(64), ForeignKey("profiles.profile_id"), primary_key=True)
 
-    fit_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), index=True)
+    fit_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
     fit_class: Mapped[str] = mapped_column(
         Enum("Good", "Maybe", "No", name="fit_class_profile"),
         nullable=False,
-        server_default=text("'No'"),
+        default="No",
     )
     penalty_flags: Mapped[dict | None] = mapped_column(JSON)
+
+    # Deterministic invalidation keys
+    fit_job_last_checked: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    fit_profile_cv_sha256: Mapped[str | None] = mapped_column(String(64))
+    fit_computed_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
 
     notion_page_id: Mapped[str | None] = mapped_column(String(36))
     notion_last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime)
     notion_last_error: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+        DateTime, server_default=func.current_timestamp(), nullable=False
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP"),
-        server_onupdate=text("CURRENT_TIMESTAMP"),
     )
 
     job: Mapped["Job"] = relationship(back_populates="profiles")
-    profile: Mapped["Profile"] = relationship(back_populates="jobs")

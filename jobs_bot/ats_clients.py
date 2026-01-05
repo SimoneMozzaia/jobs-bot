@@ -10,22 +10,33 @@ import requests
 def _truncate(value: str | None, max_len: int) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
-    return text[:max_len] if len(text) > max_len else text
+    v = str(value).strip()
+    return v[:max_len] if len(v) > max_len else v
 
 
-_SALARY_RE = re.compile(
-    r"(?i)(\$|€|£)\s?\d[\d,\. ]{2,}\s?(?:-\s?(\$|€|£)?\s?\d[\d,\. ]{2,})?"
+_salary_re = re.compile(
+    r"(?i)\b(\$|€|£)\s?\d[\d,\. ]{2,}\s?(?:-\s?(\$|€|£)?\s?\d[\d,\. ]{2,})?"
 )
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(value: str) -> str:
+    txt = (value or "").replace("\r", "").strip()
+    if not txt:
+        return ""
+    txt = _HTML_TAG_RE.sub(" ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
 
 
 def extract_salary_text(text: str | None) -> str | None:
     if not text:
         return None
-    match = _SALARY_RE.search(text)
-    if not match:
+    m = _salary_re.search(text)
+    if not m:
         return None
-    return _truncate(match.group(0).strip(), 255)
+    return _truncate(m.group(0).strip(), 255)
 
 
 def _ensure_json(resp: requests.Response) -> Any:
@@ -40,7 +51,7 @@ def _ensure_json(resp: requests.Response) -> Any:
     raise ValueError(f"Non-JSON response (content-type={ctype})")
 
 
-def fetch_lever_postings(api_base: str, *, timeout_s: int = 20) -> list[dict]:
+def fetch_lever_postings(api_base: str, timeout_s: int = 20) -> list[dict]:
     url = api_base
     if "mode=json" not in url:
         url = url + ("&" if "?" in url else "?") + "mode=json"
@@ -96,7 +107,6 @@ def fetch_lever_postings(api_base: str, *, timeout_s: int = 20) -> list[dict]:
 
 def fetch_greenhouse_jobs_page(
     api_base: str,
-    *,
     page: int,
     timeout_s: int = 20,
     per_page: int = 100,
@@ -111,6 +121,7 @@ def fetch_greenhouse_jobs_page(
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not jobs:
         return []
+
     if not isinstance(jobs, list):
         raise ValueError("Greenhouse jobs field is not a list")
 
@@ -159,22 +170,25 @@ def fetch_greenhouse_jobs_page(
     return out
 
 
-def fetch_greenhouse_jobs(
+def fetch_greenhouse_job_detail(
     api_base: str,
     *,
+    ats_job_id: str,
     timeout_s: int = 20,
-    max_pages: int = 50,
-    per_page: int = 100,
-) -> list[dict]:
-    out: list[dict] = []
-    for page in range(1, max_pages + 1):
-        page_jobs = fetch_greenhouse_jobs_page(
-            api_base,
-            page=page,
-            timeout_s=timeout_s,
-            per_page=per_page,
-        )
-        if not page_jobs:
-            break
-        out.extend(page_jobs)
-    return out
+) -> dict[str, Any]:
+    base = api_base.rstrip("/")
+    url = f"{base}/jobs/{ats_job_id}"
+
+    resp = requests.get(url, timeout=timeout_s)
+    resp.raise_for_status()
+    payload = _ensure_json(resp)
+    if not isinstance(payload, dict):
+        raise ValueError("Greenhouse job detail payload is not a dict")
+
+    content = payload.get("content") or ""
+    raw_text = _strip_html(str(content)) if content else ""
+    return {
+        "raw_json": payload,
+        "raw_text": raw_text,
+        "salary_text": extract_salary_text(raw_text),
+    }

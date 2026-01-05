@@ -8,10 +8,11 @@ from sqlalchemy import select
 from jobs_bot.config import get_settings
 from jobs_bot.db import make_session_factory
 from jobs_bot.enrich_llm import enrich_pending_jobs
+from jobs_bot.fit_scoring import compute_fit_scores_for_profile
 from jobs_bot.ingest_ats import ingest_all_sources
 from jobs_bot.llm_client import OpenAIResponsesClient
 from jobs_bot.logging_utils import LogContext, configure_logging
-from jobs_bot.models import Source
+from jobs_bot.models import Profile, Source
 from jobs_bot.notion_client import NotionClient
 from jobs_bot.profile_bootstrap import bootstrap_profile
 from jobs_bot.sync_notion import sync_pending_jobs
@@ -19,11 +20,11 @@ from jobs_bot.sync_notion import sync_pending_jobs
 
 def _collect_active_source_errors(session) -> list[str]:
     sources = session.execute(select(Source).where(Source.is_active == 1)).scalars().all()
-    errors: list[str] = []
-    for src in sources:
-        if src.last_error:
-            errors.append(f"{src.ats_type}:{src.company_slug}: {src.last_error}")
-    return errors
+    return [
+        f"{src.ats_type}:{src.company_slug}: {src.last_error}"
+        for src in sources
+        if src.last_error
+    ]
 
 
 def main() -> None:
@@ -36,9 +37,6 @@ def main() -> None:
         logger.exception("Configuration invalid.", extra={"event": "config_invalid"})
         sys.exit(2)
 
-    multi_profile_enabled = bool(settings.profiles_dir)
-    active_profile_id = settings.profile_id if multi_profile_enabled else None
-
     logger.info(
         "Starting ingest run.",
         extra={
@@ -49,39 +47,34 @@ def main() -> None:
             "sync_to_notion": settings.sync_to_notion,
             "enrich_with_llm": settings.enrich_with_llm,
             "enrich_limit": settings.enrich_limit,
-            "multi_profile_enabled": multi_profile_enabled,
-            "active_profile_id": active_profile_id,
+            "multi_profile": settings.multi_profile_enabled,
+            "profile_id": settings.profile_id,
         },
     )
 
     SessionLocal = make_session_factory(settings)
 
     with SessionLocal() as session:
-        # Multi-profile bootstrap (fail-fast before consuming external API budgets)
-        if multi_profile_enabled:
+        profile: Profile | None = None
+
+        if settings.multi_profile_enabled and settings.profile_cv_path:
             try:
-                cv_path = settings.profile_cv_path
-                if cv_path is None:
-                    raise RuntimeError("profiles_dir is set but profile_cv_path is None")
                 profile, changed = bootstrap_profile(
                     session,
                     profile_id=settings.profile_id,
-                    cv_path=cv_path,
+                    cv_path=settings.profile_cv_path,
                 )
                 logger.info(
                     "Profile bootstrapped.",
                     extra={
                         "event": "profile_bootstrap_done",
-                        "profile_id": profile.profile_id,
-                        "cv_sha256": profile.cv_sha256,
+                        "profile_id": settings.profile_id,
                         "changed": changed,
+                        "cv_sha256": profile.cv_sha256,
                     },
                 )
             except Exception:
-                logger.exception(
-                    "Profile bootstrap failed.",
-                    extra={"event": "profile_bootstrap_failed", "profile_id": settings.profile_id},
-                )
+                logger.exception("Profile bootstrap failed.", extra={"event": "profile_bootstrap_failed"})
                 sys.exit(2)
 
         sources_ok, jobs_created = ingest_all_sources(
@@ -140,7 +133,6 @@ def main() -> None:
                         "openai_model": settings.openai_model,
                     },
                 )
-
                 if stats.attempted > 0 and stats.enriched == 0 and stats.failed == stats.attempted:
                     logger.error(
                         "All LLM enrichments failed.",
@@ -150,6 +142,28 @@ def main() -> None:
 
             except Exception:
                 logger.exception("LLM enrichment crashed.", extra={"event": "llm_enrich_crashed"})
+                sys.exit(2)
+
+        # Fit scoring per profile
+        if settings.multi_profile_enabled and profile is not None:
+            try:
+                fit_stats = compute_fit_scores_for_profile(
+                    session,
+                    profile=profile,
+                    limit=max(1, settings.sync_limit),
+                )
+                logger.info(
+                    "Fit scoring completed.",
+                    extra={
+                        "event": "fit_scoring_done",
+                        "profile_id": profile.profile_id,
+                        "attempted": fit_stats.attempted,
+                        "inserted": fit_stats.inserted_jobs,
+                        "updated": fit_stats.updated_jobs,
+                    },
+                )
+            except Exception:
+                logger.exception("Fit scoring failed.", extra={"event": "fit_scoring_failed"})
                 sys.exit(2)
 
         if settings.sync_to_notion:
@@ -165,11 +179,11 @@ def main() -> None:
                     notion=notion,
                     limit=settings.sync_limit,
                     fit_min=settings.fit_min,
-                    profile_id=active_profile_id,
+                    profile_id=settings.profile_id if settings.multi_profile_enabled else None,
                 )
                 logger.info(
                     "Notion sync completed.",
-                    extra={"event": "notion_sync_done", "synced": synced, "profile_id": active_profile_id},
+                    extra={"event": "notion_sync_done", "synced": synced},
                 )
             except Exception:
                 logger.exception("Notion sync failed.", extra={"event": "notion_sync_failed"})
