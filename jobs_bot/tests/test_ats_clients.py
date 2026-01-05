@@ -14,7 +14,7 @@ def test_fetch_lever_postings_parses():
     api_base = "https://api.lever.co/v0/postings/acme"
     responses.add(
         responses.GET,
-        api_base,
+        f"{api_base}?mode=json",
         json=[
             {"id": "1", "text": "Engineer", "hostedUrl": "u1", "descriptionPlain": "desc"},
         ],
@@ -33,7 +33,7 @@ def test_fetch_greenhouse_jobs_page_parses():
     api_base = "https://boards-api.greenhouse.io/v1/boards/acme"
     responses.add(
         responses.GET,
-        f"{api_base}/jobs?content=true&page=1&per_page=100",
+        f"{api_base}/jobs?content=true",
         json={
             "jobs": [
                 {
