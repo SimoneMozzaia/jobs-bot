@@ -109,9 +109,21 @@ def fetch_greenhouse_jobs_page(
     per_page: int = 100,
 ) -> list[dict[str, Any]]:
     base = api_base.rstrip("/")
-    url = f"{base}/jobs?page={page}&per_page={per_page}"
+    url = f"{base}/jobs"
 
-    resp = requests.get(url, timeout=timeout_s)
+    # The public Greenhouse "boards" API supports pagination parameters,
+    # but we intentionally avoid appending query parameters for the
+    # first page with default page size.
+    #
+    # This keeps the canonical URL stable (useful for request mocking)
+    # while still allowing pagination if we ever need it.
+    params: dict[str, int] = {}
+    if page and page > 1:
+        params["page"] = int(page)
+    if per_page and per_page != 100:
+        params["per_page"] = int(per_page)
+
+    resp = requests.get(url, params=params, timeout=timeout_s)
     resp.raise_for_status()
     data = resp.json() or {}
     jobs = data.get("jobs") or []

@@ -7,97 +7,20 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .api_usage import can_consume_call, can_create_new_job, utcnow_naive
-from .ats_clients import fetch_greenhouse_jobs_page, fetch_lever_postings
+from .api_usage import can_consume_call, can_create_new_job
+from .ats_clients import (
+    fetch_greenhouse_jobs_page,
+    fetch_lever_postings,
+    fetch_successfactors_postings,
+    fetch_workable_jobs,
+    fetch_workday_jobs_page,
+)
 from .models import Job, Source
 
 
-def _build_job_uid(ats_type: str, company_slug: str, ats_job_id: str) -> str:
-    key = f"{ats_type}:{company_slug}:{ats_job_id}"
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()
-
-
-def upsert_job(session: Session, *, source: Source, posting: dict[str, Any], now: dt.datetime) -> bool:
-    """
-    Idempotent upsert into jobs.
-
-    Returns True only when a NEW Job row is created.
-    Updates are always allowed, even if the "new jobs per day" cap is reached.
-    """
-    ats_job_id = (posting.get("ats_job_id") or "").strip()
-    if not ats_job_id:
-        raise ValueError("posting missing ats_job_id")
-
-    company_slug = (getattr(source, "company_slug", None) or "").strip()
-    if not company_slug:
-        raise ValueError("source missing company_slug")
-
-    ats_type = (getattr(source, "ats_type", None) or "").strip()
-    if not ats_type:
-        raise ValueError("source missing ats_type")
-
-    job_uid = _build_job_uid(ats_type, company_slug, ats_job_id)
-
-    job = session.get(Job, job_uid)
-    created = False
-
-    title = (posting.get("title") or "").strip() or "Untitled"
-    url = (posting.get("url") or "").strip() or None
-    raw_json = posting.get("raw_json") or {}
-    raw_text = posting.get("raw_text") or ""
-    salary_text = (posting.get("salary_text") or "").strip() or None
-    location_raw = (posting.get("location_raw") or "").strip() or None
-    workplace_raw = (posting.get("workplace_raw") or "").strip() or None
-
-    if job is None:
-        # NEW job -> respect daily cap
-        if not can_create_new_job(session, max_new_per_day=posting.get("max_new_jobs_per_day", 0) or 0):
-            return False
-
-        job = Job(
-            job_uid=job_uid,
-            source_id=source.id,
-            ats_job_id=ats_job_id,
-            title=title,
-            company=(posting.get("company") or getattr(source, "company_name", "") or "").strip() or None,
-            url=url,
-            first_seen=now,
-            last_seen=now,
-            last_checked=now,
-            raw_json=raw_json,
-            raw_text=raw_text,
-            salary_text=salary_text,
-            location_raw=location_raw,
-            workplace_raw=workplace_raw,
-            # keep legacy columns for DB backward-compatibility
-            fit_score=0,
-            fit_class="No",
-        )
-        session.add(job)
-        created = True
-    else:
-        # UPDATE existing (always allowed)
-        job.title = title
-        if posting.get("company") is not None:
-            job.company = (posting.get("company") or "").strip() or job.company
-        if url:
-            job.url = url
-
-        job.last_seen = now
-        job.last_checked = now
-
-        job.raw_json = raw_json
-        if raw_text is not None:
-            job.raw_text = raw_text
-
-        if salary_text is not None:
-            job.salary_text = salary_text
-        if location_raw is not None:
-            job.location_raw = location_raw
-        if workplace_raw is not None:
-            job.workplace_raw = workplace_raw
-
-    return created
+def _job_uid(*, ats_type: str, company_slug: str, ats_job_id: str) -> str:
+    key = f"{ats_type}:{company_slug}:{ats_job_id}".encode("utf-8")
+    return hashlib.sha1(key).hexdigest()
 
 
 def ingest_all_sources(
@@ -112,115 +35,185 @@ def ingest_all_sources(
     per_source_limit: int | None,
 ) -> tuple[int, int]:
     """
-    Ingest postings from all active sources.
+    Fetch jobs from all active sources and upsert into jobs.
 
-    Returns:
-      (sources_ok, jobs_created)
+    Supported source.ats_type:
+      - lever
+      - greenhouse
+      - workday (public career-site feed via wday/cxs)
+      - successfactors (public XML job feed)
+      - workable (public company feed)
 
-    Notes:
-    - sources_ok counts sources processed without raising an exception
-      (even if 0 jobs were returned).
-    - max_fetch_per_run is a global cap across ALL sources.
+    Returns: (sources_ok_count, new_jobs_created_count)
     """
-    now = utcnow_naive()
-
     sources_ok = 0
-    created_jobs = 0
-    processed = 0
+    created = 0
+    items_processed = 0
 
-    stmt = select(Source).where(Source.is_active == 1).order_by(Source.id.asc())
-    sources = session.execute(stmt).scalars().all()
+    sources = session.execute(select(Source).where(Source.is_active == 1)).scalars().all()
 
     for src in sources:
-        if processed >= max_fetch_per_run:
+        if items_processed >= max_fetch_per_run:
+            break
+
+        ats_type = (src.ats_type or "").strip().lower()
+        src.last_error = None
+        session.flush()
+
+        # How many more items we can accept this run (global cap)
+        remaining_capacity = max_fetch_per_run - items_processed
+        if remaining_capacity <= 0:
             break
 
         try:
-            ats_type = (getattr(src, "ats_type", None) or "").strip()
+            postings: list[dict[str, Any]] = []
 
             if ats_type == "lever":
-                if not can_consume_call(session, "lever", max_per_day=max_calls_per_day):
+                if not can_consume_call(session, ats_type, max_per_day=max_calls_per_day):
                     src.last_error = "daily_api_cap_reached"
                     session.commit()
                     continue
 
                 postings = fetch_lever_postings(src.api_base, timeout_s=request_timeout_s)
 
-                if per_source_limit is not None:
-                    postings = postings[: max(per_source_limit, 0)]
-
-                for p in postings:
-                    if processed >= max_fetch_per_run:
-                        break
-
-                    # propagate cap into upsert (only used for NEW jobs)
-                    p = dict(p)
-                    p["max_new_jobs_per_day"] = max_new_jobs_per_day
-
-                    if upsert_job(session, source=src, posting=p, now=now):
-                        created_jobs += 1
-                    processed += 1
-
-                src.last_ok_at = now
-                src.last_error = None
-                session.commit()
-                sources_ok += 1
-                continue
-
-            if ats_type == "greenhouse":
-                # Greenhouse uses paginated calls; count them against provider budget.
-                all_postings: list[dict[str, Any]] = []
-
+            elif ats_type == "greenhouse":
+                # Greenhouse uses paginated fetch; we count each page as an API call.
                 for page in range(1, greenhouse_max_pages + 1):
-                    if processed >= max_fetch_per_run:
-                        break
-
-                    if not can_consume_call(session, "greenhouse", max_per_day=max_calls_per_day):
+                    if not can_consume_call(session, ats_type, max_per_day=max_calls_per_day):
                         src.last_error = "daily_api_cap_reached"
                         session.commit()
                         break
 
-                    page_items = fetch_greenhouse_jobs_page(
+                    page_jobs = fetch_greenhouse_jobs_page(
                         src.api_base,
                         page=page,
                         timeout_s=request_timeout_s,
                         per_page=greenhouse_per_page,
                     )
-                    if not page_items:
-                        break
-                    all_postings.extend(page_items)
-
-                    if per_source_limit is not None and len(all_postings) >= per_source_limit:
-                        all_postings = all_postings[:per_source_limit]
+                    if not page_jobs:
                         break
 
-                for p in all_postings:
-                    if processed >= max_fetch_per_run:
+                    postings.extend(page_jobs)
+
+                    if per_source_limit is not None and len(postings) >= per_source_limit:
+                        postings = postings[:per_source_limit]
                         break
 
-                    p = dict(p)
-                    p["max_new_jobs_per_day"] = max_new_jobs_per_day
+                    if len(postings) >= remaining_capacity:
+                        postings = postings[:remaining_capacity]
+                        break
 
-                    if upsert_job(session, source=src, posting=p, now=now):
-                        created_jobs += 1
-                    processed += 1
+            elif ats_type == "workday":
+                # Workday public feed typically uses limit/offset pagination.
+                # We reuse greenhouse_per_page / greenhouse_max_pages as generic paging controls.
+                per_page = max(1, int(greenhouse_per_page))
+                for page_idx in range(greenhouse_max_pages):
+                    if not can_consume_call(session, "workday", max_per_day=max_calls_per_day):
+                        src.last_error = "daily_api_cap_reached"
+                        session.commit()
+                        break
 
-                src.last_ok_at = now
-                if src.last_error == "daily_api_cap_reached":
-                    # keep the cap error for observability
+                    offset = page_idx * per_page
+                    page_jobs = fetch_workday_jobs_page(
+                        src.api_base,
+                        offset=offset,
+                        limit=per_page,
+                        timeout_s=request_timeout_s,
+                    )
+                    if not page_jobs:
+                        break
+
+                    postings.extend(page_jobs)
+
+                    if per_source_limit is not None and len(postings) >= per_source_limit:
+                        postings = postings[:per_source_limit]
+                        break
+
+                    if len(postings) >= remaining_capacity:
+                        postings = postings[:remaining_capacity]
+                        break
+
+            elif ats_type == "successfactors":
+                if not can_consume_call(session, "successfactors", max_per_day=max_calls_per_day):
+                    src.last_error = "daily_api_cap_reached"
                     session.commit()
-                else:
-                    src.last_error = None
+                    continue
+
+                postings = fetch_successfactors_postings(src.api_base, timeout_s=request_timeout_s)
+
+            elif ats_type == "workable":
+                if not can_consume_call(session, "workable", max_per_day=max_calls_per_day):
+                    src.last_error = "daily_api_cap_reached"
                     session.commit()
-                    sources_ok += 1
+                    continue
+
+                postings = fetch_workable_jobs(src.api_base, timeout_s=request_timeout_s)
+
+            else:
+                src.last_error = f"unsupported_ats_type:{ats_type}"
+                session.commit()
                 continue
 
-            # Unknown provider
-            src.last_error = f"unsupported_ats_type:{ats_type or 'missing'}"
+            # Apply caps
+            if per_source_limit is not None:
+                postings = postings[:per_source_limit]
+            postings = postings[:remaining_capacity]
+
+            # Upsert jobs
+            for p in postings:
+                if items_processed >= max_fetch_per_run:
+                    break
+
+                if not can_create_new_job(session, max_new_per_day=max_new_jobs_per_day):
+                    src.last_error = "daily_new_jobs_cap_reached"
+                    session.commit()
+                    break
+
+                ats_job_id = str(p["ats_job_id"])
+                job_uid = _job_uid(ats_type=ats_type, company_slug=src.company_slug, ats_job_id=ats_job_id)
+
+                existing = session.get(Job, job_uid)
+                now = dt.datetime.utcnow()
+
+                if existing is None:
+                    job = Job(
+                        job_uid=job_uid,
+                        source_id=src.id,
+                        ats_job_id=ats_job_id,
+                        title=p.get("title") or "",
+                        company=src.company_name,
+                        url=p.get("url") or "",
+                        location_raw=p.get("location_raw"),
+                        workplace_raw=p.get("workplace_raw"),
+                        salary_text=p.get("salary_text"),
+                        raw_json=p.get("raw_json") or {},
+                        raw_text=p.get("raw_text"),
+                        first_seen=now,
+                        last_seen=now,
+                        last_checked=now,
+                        fit_score=0,
+                        fit_class="No",
+                    )
+                    session.add(job)
+                    created += 1
+                else:
+                    existing.title = p.get("title") or existing.title
+                    existing.url = p.get("url") or existing.url
+                    existing.location_raw = p.get("location_raw") or existing.location_raw
+                    existing.workplace_raw = p.get("workplace_raw") or existing.workplace_raw
+                    existing.salary_text = p.get("salary_text") or existing.salary_text
+                    existing.raw_json = p.get("raw_json") or existing.raw_json
+                    existing.raw_text = p.get("raw_text") or existing.raw_text
+                    existing.last_seen = now
+                    existing.last_checked = now
+
+                items_processed += 1
+
+            session.commit()
+            sources_ok += 1
+
+        except Exception as e:  # noqa: BLE001
+            src.last_error = f"ingest_error:{type(e).__name__}"
             session.commit()
 
-        except Exception as exc:  # noqa: BLE001 (operational pipeline: persist error & continue)
-            src.last_error = f"ingest_failed:{type(exc).__name__}:{exc}"
-            session.commit()
-
-    return sources_ok, created_jobs
+    return sources_ok, created
