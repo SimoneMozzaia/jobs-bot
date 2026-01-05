@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 from pathlib import Path
+from typing import Optional
 
+from docx import Document
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from .api_usage import utcnow_naive
-from .cv_reader import read_docx_text
 from .models import JobProfile, Profile
 
 
-def sha256_file(path: Path) -> str:
+class ProfileBootstrapError(RuntimeError):
+    """Raised when profile bootstrap fails in a way that should stop the run."""
+
+
+def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -19,54 +24,77 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def bootstrap_profile(session: Session, *, profile_id: str, cv_path: str) -> tuple[Profile, bool]:
-    """Create or refresh a Profile row based on the CV on disk.
+def _extract_docx_text(path: Path) -> str:
+    """Extract deterministic plain text from a .docx file."""
+    doc = Document(str(path))
+    parts: list[str] = []
+    for p in doc.paragraphs:
+        txt = (p.text or "").strip()
+        if txt:
+            parts.append(txt)
+    return "\n".join(parts).strip()
+
+
+def bootstrap_profile(
+    session: Session,
+    *,
+    profile_id: str,
+    cv_path: str,
+    now: Optional[dt.datetime] = None,
+) -> tuple[Profile, bool]:
+    """Create or refresh a profile record from a CV file.
 
     Returns:
-        (profile, changed)
-
-    Behavior:
-        - compute cv_sha256
-        - read CV text from docx and store profile_text
-        - upsert Profile
-        - if hash changed, invalidate per-job fit state (JobProfile)
+        (profile, changed): changed=True when the profile was created or its cv_sha256 changed.
     """
-    path = Path(cv_path)
-    if not path.exists():
-        raise RuntimeError(f"CV file not found: {path}")
+    if not profile_id or not profile_id.strip():
+        raise ProfileBootstrapError("profile_id is required")
 
-    now = utcnow_naive()
-    digest = sha256_file(path)
-    cv_text = read_docx_text(path)
+    cv = Path(cv_path)
+    if not cv.exists() or not cv.is_file():
+        raise ProfileBootstrapError(f"CV file not found: {cv}")
 
-    profile = session.get(Profile, profile_id)
+    now = now or dt.datetime.now(dt.UTC).replace(tzinfo=None)
+
+    cv_sha256 = _sha256_file(cv)
+
+    existing = session.get(Profile, profile_id)
+
+    try:
+        profile_text = _extract_docx_text(cv)
+    except Exception as exc:
+        # Best-effort persist error for debugging, then fail fast.
+        if existing is not None:
+            existing.last_error = str(exc)
+            session.commit()
+        raise ProfileBootstrapError(f"Failed to parse CV .docx: {exc}") from exc
+
     changed = False
-
-    if profile is None:
+    if existing is None:
         profile = Profile(
             profile_id=profile_id,
-            cv_path=str(path),
-            cv_sha256=digest,
-            profile_text=cv_text,
-            analyzed_at=None,
+            cv_path=str(cv),
+            cv_sha256=cv_sha256,
             profile_json=None,
+            profile_text=profile_text,
+            analyzed_at=None,
             last_error=None,
         )
         session.add(profile)
-        session.commit()
-        return profile, True
-
-    if profile.cv_sha256 != digest or profile.cv_path != str(path):
         changed = True
-        profile.cv_sha256 = digest
-        profile.cv_path = str(path)
-        profile.profile_text = cv_text
+    else:
+        profile = existing
+        if (profile.cv_sha256 or "") != cv_sha256 or (profile.cv_path or "") != str(cv):
+            profile.cv_path = str(cv)
+            profile.cv_sha256 = cv_sha256
+            profile.profile_text = profile_text
+            profile.profile_json = None
+            profile.analyzed_at = None
+            profile.last_error = None
+            changed = True
 
-        # In future: CV->profile_json via LLM; for now reset analysis cache on change.
-        profile.profile_json = None
-        profile.analyzed_at = None
-        profile.last_error = None
-
+    if changed:
+        # Deterministic invalidation: reset fit fields so scoring will recompute.
         session.execute(
             update(JobProfile)
             .where(JobProfile.profile_id == profile_id)
@@ -77,6 +105,7 @@ def bootstrap_profile(session: Session, *, profile_id: str, cv_path: str) -> tup
                 fit_job_last_checked=None,
                 fit_profile_cv_sha256=None,
                 fit_computed_at=None,
+                # Keep notion_page_id to avoid collisions, but clear sync markers.
                 notion_last_sync=None,
                 notion_last_error=None,
             )

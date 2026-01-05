@@ -220,6 +220,9 @@ When `PROFILES_DIR` is set, the pipeline will:
 - compute fit scores per profile
 - sync Notion pages with `Profile=<PROFILE_ID>` to avoid collisions
 
+Note: Notion sync runs in multi-profile mode and requires `PROFILES_DIR` and `PROFILE_ID`.
+Pages are upserted using the composite key (Job UID, Profile).
+
 ---
 
 ## How to run
