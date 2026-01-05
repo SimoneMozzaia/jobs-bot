@@ -25,7 +25,7 @@ This project focuses on:
 
 1) Ingest job postings from:
 - Lever
-- Greenhouse
+- Greenhouse (including an optional job-detail call for richer text)
 
 2) Upsert into MySQL tables:
 - `sources`
@@ -40,9 +40,10 @@ This project focuses on:
 4) LLM enrichment (optional):
 - enriches raw job data into `job_enrichment` (summary, skills, pros/cons, salary inference, etc.)
 
-5) Multi-profile fit scoring (CV-driven):
+5) Multi-profile fit scoring (CV-driven, deterministic):
 - supports multiple profiles (multi-tenant friendly for personal use)
-- computes fit score / fit class / penalty flags per **(profile, job)**
+- bootstraps profiles from CV `.docx`
+- computes fit score / fit class / penalty flags per **(profile, job)** using rule-based logic
 
 6) Optionally sync to Notion:
 - only jobs above a fit score threshold
@@ -111,6 +112,13 @@ A job is considered “fit-stale” for a profile if:
 - `job_profile.fit_job_last_checked != job.last_checked`, OR
 - `job_profile.fit_profile_cv_sha256 != profile.cv_sha256`
 
+Scoring approach (rule-based deterministic):
+- Skill match primarily from `job_enrichment.skills_json` (LLM enrichment output).
+- Fallback skill detection from job title/text (keyword-based).
+- Seniority alignment (junior/mid/senior) inferred from CV text + job title/text.
+- Language requirements detected conservatively from job text (only when explicitly marked as “required/must/fluent/native”).
+- Location constraints applied only when the profile CV contains location hints and the job is not remote.
+
 ### Notion sync (optional)
 - Controlled by:
   - `SYNC_TO_NOTION=1` to enable
@@ -150,6 +158,7 @@ A job is considered “fit-stale” for a profile if:
 - `job_profile`: per-(job,profile) state:
   - fit score/class/flags
   - Notion mapping (page_id + sync timestamps) per profile
+  - deterministic staleness columns (`fit_job_last_checked`, `fit_profile_cv_sha256`)
 
 ### Rate limiting & caps implementation
 - API calls per provider are counted in a DB table and reserved via an atomic update.
