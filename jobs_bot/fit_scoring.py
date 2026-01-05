@@ -46,6 +46,52 @@ _LEVEL_ORDER: dict[str, int] = {
 }
 
 
+# Minimal deterministic location vocabulary.
+# We do not attempt geocoding; we only match common terms in free text.
+# Keep this list small and additive to avoid false positives.
+_LOCATION_ALIASES: dict[str, tuple[str, ...]] = {
+    # Countries
+    "italy": ("italy", "italia"),
+    "france": ("france",),
+    "switzerland": ("switzerland", "svizzera"),
+    "germany": ("germany", "deutschland"),
+    "spain": ("spain", "espana", "españa"),
+    "united_kingdom": ("united kingdom", "uk", "u.k."),
+    "united_states": ("united states", "usa", "u.s."),
+    # Cities (common)
+    "milano": ("milano", "milan"),
+    "paris": ("paris",),
+    "london": ("london",),
+    "zurich": ("zurich", "zürich"),
+}
+
+
+def _location_tokens(blob: str) -> set[str]:
+    """Return canonical location tokens found in the blob."""
+    found: set[str] = set()
+    for canon, aliases in _LOCATION_ALIASES.items():
+        for a in aliases:
+            if a and a in blob:
+                found.add(canon)
+                break
+    return found
+
+
+def _infer_workplace(workplace_raw: str | None, job_blob: str) -> str:
+    """Infer workplace category: remote, hybrid, onsite, unknown."""
+    raw = (workplace_raw or "").strip().lower()
+    if raw in {"remote", "hybrid", "onsite"}:
+        return raw
+
+    if "remote" in job_blob:
+        return "remote"
+    if "hybrid" in job_blob:
+        return "hybrid"
+    if "on-site" in job_blob or "onsite" in job_blob:
+        return "onsite"
+    return "unknown"
+
+
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
@@ -84,9 +130,7 @@ def _extract_required_languages(job_blob: str) -> set[str]:
             if alias not in job_blob:
                 continue
 
-            # marker -> language
             p1 = rf"\b(?:{markers})\b[^\n]{{0,50}}\b{re.escape(alias)}\b"
-            # language -> marker
             p2 = rf"\b{re.escape(alias)}\b[^\n]{{0,50}}\b(?:{markers})\b"
 
             if re.search(p1, job_blob) or re.search(p2, job_blob):
@@ -168,7 +212,7 @@ def _score_job(
     Penalties:
       - missing required language
       - seniority mismatch (job requires higher seniority than profile signal)
-      - (location constraints can be added here; kept conservative unless profile expresses strict needs)
+      - location mismatch (only if profile expresses a location preference and job is onsite/hybrid)
     """
     profile_blob = _norm(profile.profile_text or "")
     job_blob = _norm(job.raw_text or "")
@@ -181,26 +225,23 @@ def _score_job(
     ratio = (hits / total) if total > 0 else 0.0
 
     # Base score: make "perfect match" clearly above 80.
-    # total>0 & ratio==1 -> 90
     base_score = int(round(40 + (50 * ratio))) if total > 0 else 50
 
     penalty_flags: dict[str, Any] = {}
 
-    # Skills diagnostics (only store if something is missing)
     if total > 0 and hits < total:
         missing = [s for s in required_skills if not _contains_skill(profile_blob, s)]
         if missing:
             penalty_flags["missing_skills"] = missing
 
-    # Language penalty
     required_langs = _extract_required_languages(job_blob)
     known_langs = _profile_languages(profile_blob)
     missing_langs = sorted(required_langs - known_langs)
     if missing_langs:
-        penalty_flags["missing_required_languages"] = missing_langs
+        # Public key expected by tests/UI.
+        penalty_flags["missing_languages"] = missing_langs
         base_score -= 35
 
-    # Seniority penalty (only if both sides are known)
     job_level = _infer_job_seniority(job.title, job_blob)
     profile_level = _infer_profile_seniority(profile_blob)
     job_v = _LEVEL_ORDER.get(job_level, 0)
@@ -216,7 +257,20 @@ def _score_job(
             }
             base_score -= 20 if diff == 1 else 35
 
-    # Clamp
+    profile_locs = _location_tokens(profile_blob)
+    if profile_locs:
+        workplace = _infer_workplace(job.workplace_raw, job_blob)
+        if workplace in {"onsite", "hybrid"}:
+            job_loc_blob = _norm(f"{job.location_raw or ''} {job_blob}")
+            job_locs = _location_tokens(job_loc_blob)
+            if job_locs and not (profile_locs & job_locs):
+                penalty_flags["location_mismatch"] = {
+                    "workplace": workplace,
+                    "profile_locations": sorted(profile_locs),
+                    "job_locations": sorted(job_locs),
+                }
+                base_score -= 25
+
     score = max(0, min(100, int(base_score)))
 
     fit_class = "No"
