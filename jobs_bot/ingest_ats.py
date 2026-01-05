@@ -20,7 +20,14 @@ def sha1_uid(ats_type: str, company_slug: str, ats_job_id: str) -> str:
     return hashlib.sha1(s).hexdigest()
 
 
-def upsert_job(session: Session, src: Source, payload: dict, now: dt.datetime, *, max_new_jobs_per_day: int) -> bool:
+def upsert_job(
+    session: Session,
+    src: Source,
+    payload: dict,
+    now: dt.datetime,
+    *,
+    max_new_jobs_per_day: int,
+) -> bool:
     ats_job_id = payload["ats_job_id"]
     job_uid = sha1_uid(src.ats_type, src.company_slug, ats_job_id)
 
@@ -90,6 +97,10 @@ def ingest_all_sources(
     jobs_processed = 0
 
     for src in sources:
+        # Global per-run cap: stop before spending any additional API calls.
+        if jobs_processed >= max_fetch_per_run:
+            return sources_ok, jobs_created
+
         try:
             if src.ats_type == "lever":
                 if not can_consume_call(session, "lever", max_calls_per_day):
@@ -103,7 +114,11 @@ def ingest_all_sources(
 
                 for p in postings:
                     if jobs_processed >= max_fetch_per_run:
+                        # Source succeeded but run stops early due to per-run cap.
+                        src.last_ok_at = now
+                        src.last_error = None
                         session.commit()
+                        sources_ok += 1
                         return sources_ok, jobs_created
 
                     created = upsert_job(
@@ -146,10 +161,14 @@ def ingest_all_sources(
 
                 for j in all_jobs:
                     if jobs_processed >= max_fetch_per_run:
+                        src.last_ok_at = now
+                        src.last_error = None
                         session.commit()
+                        sources_ok += 1
                         return sources_ok, jobs_created
 
-                    if src.ats_type == "greenhouse" and not j.get("raw_text"):
+                    # Optional detail call (consumes call budget) only when list payload lacks text.
+                    if not j.get("raw_text"):
                         if stop_detail_fetch:
                             pass
                         elif not can_consume_call(session, "greenhouse", max_calls_per_day):

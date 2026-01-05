@@ -10,14 +10,20 @@ import requests
 def _truncate(value: str | None, max_len: int) -> str | None:
     if value is None:
         return None
-    v = str(value).strip()
-    return v[:max_len] if len(v) > max_len else v
+    v = value.strip()
+    if not v:
+        return None
+    return v[:max_len]
 
 
+# NOTE:
+# Do NOT use a leading "\b" (word boundary) here.
+# Currency symbols like "€" are not word-characters, and a boundary won't exist
+# between whitespace and a non-word symbol. That would cause valid salary
+# strings like "Salary € 80,000 - € 100,000" to not match.
 _salary_re = re.compile(
-    r"(?i)\b(\$|€|£)\s?\d[\d,\. ]{2,}\s?(?:-\s?(\$|€|£)?\s?\d[\d,\. ]{2,})?"
+    r"(?i)(\$|€|£)\s*\d[\d,\. ]{1,}\s*(?:-\s*(\$|€|£)?\s*\d[\d,\. ]{1,})?"
 )
-
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -36,7 +42,13 @@ def extract_salary_text(text: str | None) -> str | None:
     m = _salary_re.search(text)
     if not m:
         return None
-    return _truncate(m.group(0).strip(), 255)
+    return _truncate(m.group(0), 255)
+
+
+def _ms_to_dt_utc(ms: int | None) -> dt.datetime | None:
+    if not ms:
+        return None
+    return dt.datetime.fromtimestamp(ms / 1000.0, tz=dt.UTC).replace(tzinfo=None)
 
 
 def _ensure_json(resp: requests.Response) -> Any:
@@ -51,54 +63,38 @@ def _ensure_json(resp: requests.Response) -> Any:
     raise ValueError(f"Non-JSON response (content-type={ctype})")
 
 
-def fetch_lever_postings(api_base: str, timeout_s: int = 20) -> list[dict]:
-    url = api_base
-    if "mode=json" not in url:
-        url = url + ("&" if "?" in url else "?") + "mode=json"
+def fetch_lever_postings(api_base: str, *, timeout_s: int = 20) -> list[dict[str, Any]]:
+    base = api_base.rstrip("/")
+    url = f"{base}?mode=json"
 
     resp = requests.get(url, timeout=timeout_s)
     resp.raise_for_status()
-    data = _ensure_json(resp)
-    if not isinstance(data, list):
-        raise ValueError("Lever payload is not a list")
+    data = resp.json() or []
 
-    out: list[dict] = []
-    for p in data:
-        if not isinstance(p, dict):
-            continue
-        job_id = str(p.get("id") or "").strip()
-        if not job_id:
-            continue
+    out: list[dict[str, Any]] = []
+    for item in data:
+        raw_text = item.get("descriptionPlain") or ""
+        salary_text = extract_salary_text(raw_text)
 
-        title = str(p.get("text") or "").strip()
-        hosted_url = str(p.get("hostedUrl") or "").strip()
-
-        posted_at = None
-        ca = p.get("createdAt")
-        if isinstance(ca, (int, float)):
-            posted_at = dt.datetime.fromtimestamp(ca / 1000.0, tz=dt.UTC).replace(tzinfo=None)
-
-        location_raw = None
-        cats = p.get("categories") or {}
-        if isinstance(cats, dict):
-            location_raw = cats.get("location")
-
-        desc = p.get("descriptionPlain") or p.get("description") or ""
-        raw_text = desc.strip() if isinstance(desc, str) else ""
+        categories = item.get("categories") or {}
+        location_raw = categories.get("location")
+        workplace_raw = None
+        if isinstance(location_raw, str):
+            loc_lower = location_raw.lower()
+            if "remote" in loc_lower:
+                workplace_raw = "Remote"
 
         out.append(
             {
-                "ats_job_id": job_id,
-                "title": _truncate(title, 512) or "Untitled",
-                "url": _truncate(hosted_url, 1024) or "",
-                "location_raw": _truncate(location_raw, 512),
-                "workplace_raw": _truncate(
-                    "Remote" if (location_raw and "remote" in str(location_raw).lower()) else None, 128
-                ),
-                "posted_at": posted_at,
-                "raw_json": p,
+                "ats_job_id": str(item.get("id") or ""),
+                "title": _truncate(item.get("text"), 512) or "Untitled",
+                "url": _truncate(item.get("hostedUrl"), 1024) or "",
+                "posted_at": _ms_to_dt_utc(item.get("createdAt")),
+                "location_raw": _truncate(location_raw, 512) if isinstance(location_raw, str) else None,
+                "workplace_raw": _truncate(workplace_raw, 128),
                 "raw_text": raw_text,
-                "salary_text": extract_salary_text(raw_text),
+                "salary_text": salary_text,
+                "raw_json": item,
             }
         )
 
@@ -107,66 +103,37 @@ def fetch_lever_postings(api_base: str, timeout_s: int = 20) -> list[dict]:
 
 def fetch_greenhouse_jobs_page(
     api_base: str,
+    *,
     page: int,
     timeout_s: int = 20,
     per_page: int = 100,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     base = api_base.rstrip("/")
-    url = f"{base}/jobs"
+    url = f"{base}/jobs?page={page}&per_page={per_page}"
 
-    resp = requests.get(url, params={"page": page, "per_page": per_page}, timeout=timeout_s)
+    resp = requests.get(url, timeout=timeout_s)
     resp.raise_for_status()
-    data = _ensure_json(resp)
+    data = resp.json() or {}
+    jobs = data.get("jobs") or []
 
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not jobs:
-        return []
-
-    if not isinstance(jobs, list):
-        raise ValueError("Greenhouse jobs field is not a list")
-
-    out: list[dict] = []
-    for j in jobs:
-        if not isinstance(j, dict):
-            continue
-        job_id = j.get("id")
-        if job_id is None:
-            continue
-
-        title = str(j.get("title") or "").strip()
-        abs_url = str(j.get("absolute_url") or "").strip()
-
-        loc = j.get("location") or {}
-        location_raw = loc.get("name") if isinstance(loc, dict) else None
-
-        posted_at = None
-        ua = j.get("updated_at")
-        if isinstance(ua, str) and ua:
-            try:
-                posted_at = (
-                    dt.datetime.fromisoformat(ua.replace("Z", "+00:00"))
-                    .astimezone(dt.UTC)
-                    .replace(tzinfo=None)
-                )
-            except Exception:
-                posted_at = None
+    out: list[dict[str, Any]] = []
+    for item in jobs:
+        location = item.get("location") or {}
+        location_raw = location.get("name") if isinstance(location, dict) else None
 
         out.append(
             {
-                "ats_job_id": str(job_id),
-                "title": _truncate(title, 512) or "Untitled",
-                "url": _truncate(abs_url, 1024) or "",
-                "location_raw": _truncate(location_raw, 512),
-                "workplace_raw": _truncate(
-                    "Remote" if (location_raw and "remote" in str(location_raw).lower()) else None, 128
-                ),
-                "posted_at": posted_at,
-                "raw_json": j,
-                "raw_text": "",
+                "ats_job_id": str(item.get("id") or ""),
+                "title": _truncate(item.get("title"), 512) or "Untitled",
+                "url": _truncate(item.get("absolute_url"), 1024) or "",
+                "posted_at": None,
+                "location_raw": _truncate(location_raw, 512) if isinstance(location_raw, str) else None,
+                "workplace_raw": None,
+                "raw_text": None,
                 "salary_text": None,
+                "raw_json": item,
             }
         )
-
     return out
 
 
@@ -181,14 +148,9 @@ def fetch_greenhouse_job_detail(
 
     resp = requests.get(url, timeout=timeout_s)
     resp.raise_for_status()
-    payload = _ensure_json(resp)
-    if not isinstance(payload, dict):
-        raise ValueError("Greenhouse job detail payload is not a dict")
+    data = resp.json() or {}
 
-    content = payload.get("content") or ""
-    raw_text = _strip_html(str(content)) if content else ""
-    return {
-        "raw_json": payload,
-        "raw_text": raw_text,
-        "salary_text": extract_salary_text(raw_text),
-    }
+    raw_text = data.get("content") or ""
+    salary_text = extract_salary_text(raw_text)
+
+    return {"raw_text": raw_text, "salary_text": salary_text}
