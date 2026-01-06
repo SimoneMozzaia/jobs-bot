@@ -320,6 +320,50 @@ Common causes:
 
 Failures are logged with `event=profile_bootstrap_failed` and the unit exits non-zero.
 
+## Flowchart
+flowchart TD
+  %% -----------------------
+  %% Discovery pipeline
+  %% -----------------------
+  subgraph DISCOVERY[Discovery pipeline (discovery_run.py)]
+    D0[Start] --> D1[Select regions: US/EU/UAE/CH/CANADA]
+    D1 --> D2[CompaniesMarketCap: fetch top N companies per region]
+    D2 --> D3[Normalize company identity (slug/name)]
+    D3 --> D4[Wikidata lookup (optional fallback)]
+    D4 --> D5[Fetch careers page / site hints]
+    D5 --> D6[ATS detection heuristics\n(Greenhouse/Lever/Workable/Workday/SuccessFactors/...)]
+    D6 --> D7[Upsert into sources as discovered\n(is_active=0 or staged)]
+    D7 --> D8{DISCOVERY_VERIFY_ENABLE?}
+    D8 -- yes --> D9[verify_sources: probe endpoints\nHTTP + schema checks + timeouts]
+    D9 --> D10[Promote passing sources\nset is_active=1, verified_at, last_ok_at]
+    D8 -- no --> D11[Stop (manual verify later)]
+  end
+
+  %% -----------------------
+  %% Ingest + scoring pipeline
+  %% -----------------------
+  subgraph INGEST[Ingest & Scoring pipeline (ingest_run.py)]
+    I0[Start] --> I1[Load settings (.env)]
+    I1 --> I2{SYNC_TO_NOTION=1\nand PROFILES_DIR missing?}
+    I2 -- yes --> I2E[Fail-fast: require PROFILES_DIR\n(or set SYNC_TO_NOTION=0)]
+    I2 -- no --> I3[Ingest ATS feeds for active sources]
+    I3 --> I4[Upsert jobs\n(first_seen/last_seen/last_checked/raw_json)]
+    I4 --> I5{ENRICH_WITH_LLM?}
+    I5 -- yes --> I6[Enrich pending jobs\n-> job_enrichment]
+    I5 -- no --> I7
+    I6 --> I7{PROFILES_DIR set?}
+    I7 -- yes --> I8[Bootstrap profile\n(CV SHA-256 + invalidation)]
+    I8 --> I9[Fit scoring per profile\n-> job_profile (fit_score/flags)]
+    I7 -- no --> I10[Skip profile steps]
+    I9 --> I11{SYNC_TO_NOTION?}
+    I11 -- yes --> I12[Notion upsert per (job_uid, profile_id)\nstore notion_page_id/timestamps/errors]
+    I11 -- no --> I13[Done]
+    I12 --> I13[Done]
+    I10 --> I13
+  end
+
+  DISCOVERY --> INGEST
+
 
 ---
 

@@ -46,6 +46,17 @@ def _extract_enriched_count(stats: object) -> int:
 
 
 def run_pipeline(session: Session, *, settings: Settings, logger) -> dict[str, int]:
+    # Fail fast on configuration inconsistencies.
+    #
+    # Notion sync is profile-scoped (job_profile), therefore we require
+    # multi-profile mode to be enabled via PROFILES_DIR.
+    if settings.sync_to_notion and not settings.profiles_dir:
+        raise RuntimeError(
+            "SYNC_TO_NOTION=1 requires PROFILES_DIR (profile-scoped Notion sync). "
+            "Either set PROFILES_DIR (and ensure {PROFILES_DIR}/{PROFILE_ID}/cv.docx exists) "
+            "or set SYNC_TO_NOTION=0 to run without Notion."
+        )
+
     results: dict[str, int] = {
         "sources_ok": 0,
         "jobs_created": 0,
@@ -108,11 +119,6 @@ def run_pipeline(session: Session, *, settings: Settings, logger) -> dict[str, i
         results["jobs_scored"] = int(stats.attempted)
 
     if settings.sync_to_notion:
-        if not settings.profiles_dir:
-            raise RuntimeError(
-                "SYNC_TO_NOTION requires PROFILES_DIR (multi-profile mode)"
-            )
-
         notion = NotionClient(
             token=settings.notion_token,
             version=settings.notion_version,

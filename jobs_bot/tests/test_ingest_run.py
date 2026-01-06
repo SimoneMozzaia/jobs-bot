@@ -70,3 +70,41 @@ def test_ingest_run_llm_calls_enrich_with_client(monkeypatch, sqlite_session):
     )
     assert called["ok"] is True
     assert results["jobs_enriched"] == 1
+
+
+def test_ingest_run_fails_fast_when_notion_enabled_without_profiles_dir(
+    monkeypatch,
+    sqlite_session,
+):
+    """Regression: avoid doing work (esp. LLM calls) on invalid config."""
+
+    settings = Settings(
+        notion_token="nt",
+        notion_version="2025-09-03",
+        notion_data_source_id="ds",
+        mysql_host="localhost",
+        mysql_port=3306,
+        mysql_db="jobs",
+        mysql_user="user",
+        mysql_password="pass",
+        sync_to_notion=1,
+        enrich_with_llm=1,
+        enrich_limit=5,
+        openai_api_key="test-key",
+        openai_model="dummy-model",
+        openai_base_url="https://example.invalid",
+        profiles_dir="",  # invalid for profile-scoped Notion sync
+    )
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("should not be called")
+
+    monkeypatch.setattr(ingest_run, "ingest_all_sources", _fail)
+    monkeypatch.setattr(ingest_run, "enrich_pending_jobs", _fail)
+
+    try:
+        ingest_run.run_pipeline(sqlite_session, settings=settings, logger=_DummyLogger())
+    except RuntimeError as exc:
+        assert "PROFILES_DIR" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError")
