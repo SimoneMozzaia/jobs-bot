@@ -10,10 +10,39 @@ from jobs_bot.db import make_session_factory
 from jobs_bot.enrich_llm import enrich_pending_jobs
 from jobs_bot.fit_scoring import compute_fit_scores_for_profile
 from jobs_bot.ingest_ats import ingest_all_sources
+from jobs_bot.llm_client import OpenAIResponsesClient
 from jobs_bot.logging_utils import LogContext, configure_logging
 from jobs_bot.notion_client import NotionClient
 from jobs_bot.profile_bootstrap import ProfileBootstrapError, bootstrap_profile
 from jobs_bot.sync_notion import sync_pending_jobs
+
+
+def _extract_enriched_count(stats: object) -> int:
+    """
+    Backward/forward-compatible adapter for enrich_pending_jobs() return types.
+
+    Historical tests and older implementations may return:
+      - int (number of enriched jobs)
+
+    Newer implementations return an object with:
+      - .enriched attribute
+
+    This adapter supports both to avoid brittle coupling.
+    """
+    if isinstance(stats, int):
+        return int(stats)
+
+    enriched = getattr(stats, "enriched", None)
+    if enriched is not None:
+        return int(enriched)
+
+    try:
+        return int(stats)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        raise TypeError(
+            "Unsupported return type from enrich_pending_jobs(): "
+            f"{type(stats).__name__}. Expected int or object with '.enriched'."
+        ) from exc
 
 
 def run_pipeline(session: Session, *, settings: Settings, logger) -> dict[str, int]:
@@ -41,20 +70,21 @@ def run_pipeline(session: Session, *, settings: Settings, logger) -> dict[str, i
     results["jobs_created"] = int(created)
 
     if settings.enrich_with_llm:
-        enriched = enrich_pending_jobs(
-            session,
-            openai_api_key=settings.openai_api_key,
-            openai_model=settings.openai_model,
-            openai_base_url=settings.openai_base_url,
-            limit=settings.enrich_limit,
+        client = OpenAIResponsesClient(
+            api_key=settings.openai_api_key or "",
+            model=settings.openai_model,
+            base_url=settings.openai_base_url,
             timeout_s=settings.request_timeout_s,
         )
-        results["jobs_enriched"] = int(enriched)
+        stats = enrich_pending_jobs(session, client=client, limit=settings.enrich_limit)
+        results["jobs_enriched"] = _extract_enriched_count(stats)
 
     if settings.profiles_dir:
         cv_path = settings.profile_cv_path
         if not cv_path:
-            raise ProfileBootstrapError("PROFILE_ID/PROFILES_DIR produced an empty cv path")
+            raise ProfileBootstrapError(
+                "PROFILE_ID/PROFILES_DIR produced an empty cv path"
+            )
 
         profile, changed = bootstrap_profile(
             session,
@@ -70,12 +100,18 @@ def run_pipeline(session: Session, *, settings: Settings, logger) -> dict[str, i
             },
         )
 
-        stats = compute_fit_scores_for_profile(session, profile=profile, limit=settings.sync_limit)
+        stats = compute_fit_scores_for_profile(
+            session,
+            profile=profile,
+            limit=settings.sync_limit,
+        )
         results["jobs_scored"] = int(stats.attempted)
 
     if settings.sync_to_notion:
         if not settings.profiles_dir:
-            raise RuntimeError("SYNC_TO_NOTION requires PROFILES_DIR (multi-profile mode)")
+            raise RuntimeError(
+                "SYNC_TO_NOTION requires PROFILES_DIR (multi-profile mode)"
+            )
 
         notion = NotionClient(
             token=settings.notion_token,

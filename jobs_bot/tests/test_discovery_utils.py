@@ -6,7 +6,7 @@ import responses
 from jobs_bot.ats_discovery import detect_ats_from_url_or_html
 from jobs_bot.careers_discovery import discover_careers_url
 from jobs_bot.companies_marketcap import parse_cmc_csv
-from jobs_bot.source_discovery import parse_regions
+from jobs_bot.source_discovery import DiscoveryCounts, parse_regions
 
 
 def test_parse_regions_dedup_and_normalize() -> None:
@@ -17,6 +17,14 @@ def test_parse_regions_dedup_and_normalize() -> None:
         "CANADA",
         "UAE",
     ]
+
+
+def test_discovery_counts_is_mutable() -> None:
+    c = DiscoveryCounts()
+    c.companies_seen += 1
+    c.sources_upserted = 2
+    assert c.companies_seen == 1
+    assert c.sources_upserted == 2
 
 
 def test_parse_cmc_csv_headerless() -> None:

@@ -37,7 +37,10 @@ def main() -> None:
         api_base = "https://api.lever.co/v0/postings/testco"
 
         src = session.execute(
-            select(Source).where(Source.ats_type == ats_type, Source.company_slug == company_slug)
+            select(Source).where(
+                Source.ats_type == ats_type,
+                Source.company_slug == company_slug,
+            )
         ).scalar_one_or_none()
 
         if not src:

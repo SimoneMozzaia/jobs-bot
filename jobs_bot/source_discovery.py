@@ -19,7 +19,7 @@ from .wikidata import resolve_official_website
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class DiscoveryCounts:
     companies_seen: int = 0
     websites_resolved: int = 0

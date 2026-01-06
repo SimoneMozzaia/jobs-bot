@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, text, func
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -19,19 +29,29 @@ class Source(Base):
     company_name: Mapped[str] = mapped_column(String(256), nullable=False)
     api_base: Mapped[str] = mapped_column(String(512), nullable=False)
     is_active: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    discovered_via: Mapped[str] = mapped_column(String(64), nullable=False, default="manual")
+    discovered_via: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="manual",
+    )
 
     last_ok_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     verified_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     jobs: Mapped[list["Job"]] = relationship("Job", back_populates="source")
-
 
 
 class Job(Base):
@@ -54,7 +74,11 @@ class Job(Base):
     last_checked: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
 
     # JSON payloads are dynamic: keep typing robust and SQLAlchemy-friendly.
-    raw_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    raw_json: Mapped[dict[str, object]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+    )
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Backward-compat (do not use for operational logic)
@@ -65,17 +89,26 @@ class Job(Base):
         default="No",
     )
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     source: Mapped["Source"] = relationship("Source", back_populates="jobs")
     enrichment: Mapped["JobEnrichment | None"] = relationship(
         "JobEnrichment", back_populates="job", uselist=False
     )
-    profiles: Mapped[list["JobProfile"]] = relationship("JobProfile", back_populates="job")
-
+    profiles: Mapped[list["JobProfile"]] = relationship(
+        "JobProfile",
+        back_populates="job",
+    )
 
 
 class JobEnrichment(Base):
@@ -87,18 +120,16 @@ class JobEnrichment(Base):
     skills_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     pros: Mapped[str | None] = mapped_column(Text, nullable=True)
     cons: Mapped[str | None] = mapped_column(Text, nullable=True)
-    salary: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
-    outreach_target: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Keep column sizes aligned to the production MySQL schema:
+    #   salary: varchar(255)
+    #   outreach_target: varchar(512)
+    salary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    outreach_target: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     enriched_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     llm_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
-    )
 
     job: Mapped["Job"] = relationship("Job", back_populates="enrichment")
 
@@ -116,9 +147,16 @@ class Profile(Base):
     analyzed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
 
@@ -126,7 +164,10 @@ class JobProfile(Base):
     __tablename__ = "job_profile"
 
     job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid"), primary_key=True)
-    profile_id: Mapped[str] = mapped_column(ForeignKey("profiles.profile_id"), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id"),
+        primary_key=True,
+    )
 
     fit_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fit_class: Mapped[str] = mapped_column(
@@ -136,21 +177,33 @@ class JobProfile(Base):
     )
     penalty_flags: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
 
-    fit_job_last_checked: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    fit_job_last_checked: Mapped[dt.datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
     fit_profile_cv_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fit_computed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     notion_page_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    notion_last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    notion_last_sync: Mapped[dt.datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
     notion_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     job: Mapped["Job"] = relationship("Job", back_populates="profiles")
-
 
 
 class ApiDailyUsage(Base):
@@ -166,7 +219,11 @@ class ApiDailyUsage(Base):
 
     day: Mapped[str] = mapped_column(String(10), primary_key=True)  # YYYY-MM-DD
     ats_type: Mapped[str] = mapped_column(String(32), primary_key=True)
-    calls: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    calls: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
 
 
 class JobDailyNew(Base):
@@ -178,4 +235,8 @@ class JobDailyNew(Base):
     __tablename__ = "job_daily_new"
 
     day: Mapped[str] = mapped_column(String(10), primary_key=True)  # YYYY-MM-DD
-    created: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
