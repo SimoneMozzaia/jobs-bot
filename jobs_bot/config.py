@@ -50,6 +50,22 @@ class Settings:
     profile_id: str = "default"
     profiles_dir: str = ""  # empty = disabled (keeps backward compatibility)
 
+    # ------------------------------------------------------------
+    # Source discovery (CompaniesMarketCap -> Wikidata -> careers -> ATS)
+    # ------------------------------------------------------------
+    discovery_enable: int = 0
+    discovery_regions: str = "US,EU,CH,CANADA,UAE"
+    discovery_max_companies_per_region: int = 5000
+    discovery_request_delay_s: float = 1.0
+    discovery_max_sources_per_run: int = 500
+
+    discovery_verify_enable: int = 0
+    discovery_verify_max_per_run: int = 200
+
+    discovery_user_agent: str = "jobs-bot/1.0 (+https://example.invalid)"
+    wikidata_user_agent: str = "jobs-bot/1.0 (+https://example.invalid)"
+    wikidata_name_fallback_enable: int = 0
+
     @property
     def mysql_url(self) -> str:
         """SQLAlchemy URL for MySQL with utf8mb4."""
@@ -103,10 +119,62 @@ def validate_settings(s: Settings) -> None:
     check_int("GREENHOUSE_PER_PAGE", s.greenhouse_per_page, min_v=1, max_v=500)
     check_int("GREENHOUSE_MAX_PAGES", s.greenhouse_max_pages, min_v=1, max_v=500)
 
-    check_int("INGEST_PER_SOURCE_LIMIT", s.ingest_per_source_limit, min_v=0, max_v=1_000_000)
+    check_int(
+        "INGEST_PER_SOURCE_LIMIT",
+        s.ingest_per_source_limit,
+        min_v=0,
+        max_v=1_000_000,
+    )
 
     if s.sync_to_notion not in (0, 1):
         errors.append(f"SYNC_TO_NOTION must be 0 or 1 (got {s.sync_to_notion})")
+
+    # Discovery toggles
+    if s.discovery_enable not in (0, 1):
+        errors.append(f"DISCOVERY_ENABLE must be 0 or 1 (got {s.discovery_enable})")
+    if s.discovery_verify_enable not in (0, 1):
+        errors.append(
+            "DISCOVERY_VERIFY_ENABLE must be 0 or 1 "
+            f"(got {s.discovery_verify_enable})"
+        )
+    if s.wikidata_name_fallback_enable not in (0, 1):
+        errors.append(
+            "WIKIDATA_NAME_FALLBACK_ENABLE must be 0 or 1 "
+            f"(got {s.wikidata_name_fallback_enable})"
+        )
+
+    check_int(
+        "DISCOVERY_MAX_COMPANIES_PER_REGION",
+        s.discovery_max_companies_per_region,
+        min_v=1,
+        max_v=50_000,
+    )
+    check_int(
+        "DISCOVERY_MAX_SOURCES_PER_RUN",
+        s.discovery_max_sources_per_run,
+        min_v=1,
+        max_v=50_000,
+    )
+    check_int(
+        "DISCOVERY_VERIFY_MAX_PER_RUN",
+        s.discovery_verify_max_per_run,
+        min_v=1,
+        max_v=50_000,
+    )
+
+    if not (s.discovery_regions or "").strip():
+        errors.append("DISCOVERY_REGIONS must be a non-empty comma-separated string")
+
+    if s.discovery_request_delay_s < 0 or s.discovery_request_delay_s > 30:
+        errors.append(
+            "DISCOVERY_REQUEST_DELAY_S must be between 0 and 30 "
+            f"(got {s.discovery_request_delay_s})"
+        )
+
+    if len(s.discovery_user_agent) > 200:
+        errors.append("DISCOVERY_USER_AGENT too long (max 200)")
+    if len(s.wikidata_user_agent) > 200:
+        errors.append("WIKIDATA_USER_AGENT too long (max 200)")
 
     # Notion requirements only when enabled
     if s.sync_to_notion == 1:
@@ -164,13 +232,17 @@ def get_settings() -> Settings:
     try:
         sync_to_notion = int(sync_to_notion_raw)
     except ValueError as exc:
-        raise RuntimeError(f"SYNC_TO_NOTION must be an integer (got {sync_to_notion_raw!r})") from exc
+        raise RuntimeError(
+            f"SYNC_TO_NOTION must be an integer (got {sync_to_notion_raw!r})"
+        ) from exc
 
     enrich_with_llm_raw = os.getenv("ENRICH_WITH_LLM", "0")
     try:
         enrich_with_llm = int(enrich_with_llm_raw)
     except ValueError as exc:
-        raise RuntimeError(f"ENRICH_WITH_LLM must be an integer (got {enrich_with_llm_raw!r})") from exc
+        raise RuntimeError(
+            f"ENRICH_WITH_LLM must be an integer (got {enrich_with_llm_raw!r})"
+        ) from exc
 
     if sync_to_notion == 1:
         notion_token = req("NOTION_TOKEN")
@@ -178,6 +250,23 @@ def get_settings() -> Settings:
     else:
         notion_token = (os.getenv("NOTION_TOKEN") or "").strip()
         notion_data_source_id = (os.getenv("NOTION_DATA_SOURCE_ID") or "").strip()
+
+    discovery_enable_raw = os.getenv("DISCOVERY_ENABLE", "0")
+    try:
+        discovery_enable = int(discovery_enable_raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"DISCOVERY_ENABLE must be an integer (got {discovery_enable_raw!r})"
+        ) from exc
+
+    discovery_verify_enable_raw = os.getenv("DISCOVERY_VERIFY_ENABLE", "0")
+    try:
+        discovery_verify_enable = int(discovery_verify_enable_raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "DISCOVERY_VERIFY_ENABLE must be an integer "
+            f"(got {discovery_verify_enable_raw!r})"
+        ) from exc
 
     settings = Settings(
         notion_token=notion_token,
@@ -202,9 +291,38 @@ def get_settings() -> Settings:
         enrich_limit=int(os.getenv("ENRICH_LIMIT", "10")),
         openai_api_key=(os.getenv("OPENAI_API_KEY") or "").strip() or None,
         openai_model=(os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "").strip(),
-        openai_base_url=(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1") or "").strip(),
+        openai_base_url=(
+            os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1") or ""
+        ).strip(),
         profile_id=(os.getenv("PROFILE_ID", "default") or "default").strip(),
         profiles_dir=(os.getenv("PROFILES_DIR", "") or "").strip(),
+        # Source discovery
+        discovery_enable=discovery_enable,
+        discovery_regions=(
+            os.getenv("DISCOVERY_REGIONS", "US,EU,CH,CANADA,UAE") or ""
+        ).strip(),
+        discovery_max_companies_per_region=int(
+            os.getenv("DISCOVERY_MAX_COMPANIES_PER_REGION", "5000")
+        ),
+        discovery_request_delay_s=float(os.getenv("DISCOVERY_REQUEST_DELAY_S", "1.0")),
+        discovery_max_sources_per_run=int(
+            os.getenv("DISCOVERY_MAX_SOURCES_PER_RUN", "500")
+        ),
+        discovery_verify_enable=discovery_verify_enable,
+        discovery_verify_max_per_run=int(
+            os.getenv("DISCOVERY_VERIFY_MAX_PER_RUN", "200")
+        ),
+        discovery_user_agent=(
+            os.getenv("DISCOVERY_USER_AGENT", "jobs-bot/1.0 (+https://example.invalid)")
+            or ""
+        ).strip(),
+        wikidata_user_agent=(
+            os.getenv("WIKIDATA_USER_AGENT", "jobs-bot/1.0 (+https://example.invalid)")
+            or ""
+        ).strip(),
+        wikidata_name_fallback_enable=int(
+            os.getenv("WIKIDATA_NAME_FALLBACK_ENABLE", "0")
+        ),
     )
 
     validate_settings(settings)
